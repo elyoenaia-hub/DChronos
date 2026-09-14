@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Smart Fishing v1.2.4
+    Edition: Calibration v1.2.5
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.2.4"
+local MODULE_VERSION = "1.2.5"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -38,6 +38,7 @@ end
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local VirtualInputManager = nil
 pcall(function()
@@ -623,6 +624,28 @@ local function readRarityFromObject(instance)
     return 0, "Unknown"
 end
 
+local function hasRelevantFishAttribute(instance)
+    if not instance then return false end
+
+    local names = {
+        "speciesId", "SpeciesId", "species", "Species",
+        "rarity", "Rarity", "FishRarity",
+        "caught", "Caught", "activeFish", "ActiveFish",
+        "destination", "FishState",
+    }
+
+    for _, attr in ipairs(names) do
+        local ok, value = pcall(function()
+            return instance:GetAttribute(attr)
+        end)
+        if ok and value ~= nil then
+            return true
+        end
+    end
+
+    return false
+end
+
 local function looksLikeFish(instance)
     if not instance then
         return false
@@ -634,6 +657,27 @@ local function looksLikeFish(instance)
 
     local n = lower(instance.Name)
     local path = lower(fullNameSafe(instance))
+
+    -- Runtime structure clues used by the game.
+    if hasRelevantFishAttribute(instance) then
+        return true
+    end
+
+    local ancestor = instance.Parent
+    for _ = 1, 4 do
+        if not ancestor then break end
+        if hasRelevantFishAttribute(ancestor) then
+            return true
+        end
+        local an = lower(ancestor.Name)
+        if an == "fish"
+            or an == "fishstate"
+            or an == "activefish"
+            or an:find("activefish", 1, true) then
+            return true
+        end
+        ancestor = ancestor.Parent
+    end
 
     for _, keyword in ipairs(FISH_KEYWORDS) do
         if n:find(keyword, 1, true) or path:find(keyword, 1, true) then
@@ -678,18 +722,70 @@ local function getPlayerBoat()
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 
-    if not humanoid then
-        return nil
-    end
-
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if (obj:IsA("VehicleSeat") or obj:IsA("Seat"))
-            and obj.Occupant == humanoid then
-            return obj:FindFirstAncestorOfClass("Model"), obj
+    -- Highest confidence: currently occupied seat.
+    if humanoid then
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if (obj:IsA("VehicleSeat") or obj:IsA("Seat"))
+                and obj.Occupant == humanoid then
+                local model = obj:FindFirstAncestorOfClass("Model")
+                if model then
+                    return model, obj, "occupied-seat"
+                end
+            end
         end
     end
 
-    return nil
+    local best, bestScore = nil, -math.huge
+    local playerName = lower(player.Name)
+    local userId = tostring(player.UserId)
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("Model") then
+            local name = lower(obj.Name)
+            local path = lower(fullNameSafe(obj))
+            local score = 0
+
+            if name:find("boat", 1, true)
+                or name:find("ship", 1, true)
+                or obj:FindFirstChild("Hull", true) then
+                score += 20
+            else
+                continue
+            end
+
+            for _, attrName in ipairs({"OwnerUserId", "ownerUserId", "Owner", "owner"}) do
+                local ok, value = pcall(function()
+                    return obj:GetAttribute(attrName)
+                end)
+                if ok and value ~= nil then
+                    if tostring(value) == userId or lower(value) == playerName then
+                        score += 150
+                    end
+                end
+            end
+
+            if path:find(playerName, 1, true) then
+                score += 60
+            end
+            if path:find(userId, 1, true) then
+                score += 60
+            end
+            if obj:FindFirstChild("Hull", true) then
+                score += 15
+            end
+
+            if score > bestScore then
+                best = obj
+                bestScore = score
+            end
+        end
+    end
+
+    if best and bestScore >= 20 then
+        return best, nil, "ownership-scan"
+    end
+
+    return nil, nil, "not-found"
 end
 
 local function getPlayerClaw(origin)
@@ -878,9 +974,92 @@ local function approachFishWithBoat(target)
     return true
 end
 
+local function findClawControlButton()
+    local best, bestScore = nil, -math.huge
+
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if obj:IsA("GuiButton") and obj.Visible then
+            local name = lower(obj.Name)
+            local text = ""
+
+            pcall(function()
+                text = lower(obj.Text)
+            end)
+
+            local combined = name .. " " .. text
+            local score = 0
+
+            if combined:find("claw", 1, true) then score += 120 end
+            if combined:find("grab", 1, true) then score += 90 end
+            if combined:find("lower", 1, true) then score += 80 end
+            if combined:find("catch", 1, true) then score += 55 end
+            if combined:find("fishing", 1, true) then score += 20 end
+
+            if score > bestScore and score > 0 then
+                best = obj
+                bestScore = score
+            end
+        end
+    end
+
+    return best, bestScore
+end
+
+local function activateGuiButton(button)
+    if not button then
+        return false, "No claw control button found"
+    end
+
+    local ok = pcall(function()
+        button:Activate()
+    end)
+
+    if ok then
+        return true
+    end
+
+    if VirtualInputManager then
+        local pos = button.AbsolutePosition
+        local size = button.AbsoluteSize
+        local x = math.floor(pos.X + size.X / 2)
+        local y = math.floor(pos.Y + size.Y / 2)
+
+        local clickOk, clickErr = pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            task.wait(0.08)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end)
+
+        if clickOk then
+            return true
+        end
+
+        return false, tostring(clickErr)
+    end
+
+    return false, "Button activation failed and VirtualInputManager unavailable"
+end
+
 local function sendClawInput()
+    -- PC Claw Fishing uses LMB / the labeled Claw control, not Space.
+    local button = findClawControlButton()
+
+    if button then
+        local ok, err = activateGuiButton(button)
+        if not ok then return false, err end
+
+        -- Many builds use repeated presses for lower -> grab -> raise.
+        task.wait(0.85)
+        activateGuiButton(button)
+        task.wait(0.45)
+        activateGuiButton(button)
+
+        return true, "gui-button:" .. fullNameSafe(button)
+    end
+
+    -- Fallback: plain LMB at screen center.
     if not VirtualInputManager then
-        return false, "VirtualInputManager unavailable"
+        return false, "No Claw GuiButton and VirtualInputManager unavailable"
     end
 
     local camera = Workspace.CurrentCamera
@@ -889,21 +1068,19 @@ local function sendClawInput()
     local y = math.floor(viewport.Y / 2)
 
     local ok, err = pcall(function()
-        -- Recorded PC play uses Space to lower the crane and a click to grab.
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-        task.wait(1.1)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
-        task.wait(0.08)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
-        task.wait(0.18)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+        for _ = 1, 3 do
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            task.wait(0.08)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
+            task.wait(0.6)
+        end
     end)
 
     if not ok then
         return false, tostring(err)
     end
 
-    return true
+    return true, "center-lmb"
 end
 
 local function targetIsAligned(target)
@@ -1010,6 +1187,169 @@ local function runAutoFishingCycle()
 
     task.wait(1.2)
     state.fishing.busy = false
+end
+
+
+
+-- Runtime Calibration / Diagnostics ------------------------------------------
+
+local lastDiagnosticReport = ""
+
+local function relevantAttributes(instance)
+    local parts = {}
+
+    for _, attrName in ipairs({
+        "speciesId", "SpeciesId", "species", "Species",
+        "rarity", "Rarity", "FishRarity", "caught", "Caught",
+        "activeFish", "ActiveFish", "destination", "Destination",
+        "OwnerUserId", "ownerUserId", "Owner", "FishState",
+    }) do
+        local ok, value = pcall(function()
+            return instance:GetAttribute(attrName)
+        end)
+
+        if ok and value ~= nil then
+            table.insert(parts, attrName .. "=" .. tostring(value))
+        end
+    end
+
+    return #parts > 0 and table.concat(parts, ", ") or "-"
+end
+
+local function buildDiagnosticReport()
+    local lines = {}
+
+    local function add(text)
+        table.insert(lines, tostring(text))
+    end
+
+    add("=== DChronos Claw Fishing Runtime Report ===")
+    add("ModuleVersion=" .. MODULE_VERSION)
+    add("PlaceId=" .. tostring(game.PlaceId))
+    add("UniverseId=" .. tostring(game.GameId))
+    add("Player=" .. tostring(player.Name) .. " (" .. tostring(player.UserId) .. ")")
+    add("")
+
+    local clawButton = findClawControlButton()
+    add("[ClawControl]")
+    if clawButton then
+        local text = ""
+        pcall(function() text = clawButton.Text end)
+        add("Path=" .. fullNameSafe(clawButton))
+        add("Class=" .. clawButton.ClassName)
+        add("Text=" .. tostring(text))
+    else
+        add("NOT FOUND")
+    end
+    add("")
+
+    local boat, seat, boatMethod = getPlayerBoat()
+    add("[PlayerBoat]")
+    add("Method=" .. tostring(boatMethod))
+    if boat then
+        add("Path=" .. fullNameSafe(boat))
+        add("Attrs=" .. relevantAttributes(boat))
+        add("Hull=" .. tostring(boat:FindFirstChild("Hull", true) ~= nil))
+    else
+        add("NOT FOUND")
+    end
+    if seat then
+        add("Seat=" .. fullNameSafe(seat))
+    end
+    add("")
+
+    add("[Remote Candidates]")
+    local remoteCount = 0
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+            local n = lower(obj.Name)
+            local path = lower(fullNameSafe(obj))
+
+            local important =
+                n:find("catch", 1, true)
+                or n:find("fish", 1, true)
+                or n:find("claw", 1, true)
+                or n:find("boat", 1, true)
+                or n:find("equip", 1, true)
+                or n:find("aquarium", 1, true)
+                or path:find("events", 1, true)
+
+            if important then
+                remoteCount += 1
+                add(obj.ClassName .. " | " .. fullNameSafe(obj))
+                if remoteCount >= 80 then break end
+            end
+        end
+    end
+    if remoteCount == 0 then add("NONE MATCHED") end
+    add("")
+
+    add("[Fish Candidates]")
+    local fishCount = 0
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if (obj:IsA("Model") or obj:IsA("BasePart")) and looksLikeFish(obj) then
+            fishCount += 1
+            local rank, rarity = readRarityFromObject(obj)
+            add(
+                string.format(
+                    "%02d | %s | %s | rarity=%s(%s) | attrs=%s",
+                    fishCount,
+                    obj.ClassName,
+                    fullNameSafe(obj),
+                    tostring(rarity),
+                    tostring(rank),
+                    relevantAttributes(obj)
+                )
+            )
+            if fishCount >= 35 then break end
+        end
+    end
+    if fishCount == 0 then add("NONE MATCHED") end
+    add("")
+
+    add("[Named Runtime Objects]")
+    local namedCount = 0
+    local wanted = {
+        "activefish", "fishstate", "fishrarities", "rarities",
+        "playerdata", "catchfish", "destination", "claw",
+        "hull", "events", "aquariums", "boat",
+    }
+
+    for _, root in ipairs({Workspace, ReplicatedStorage, player}) do
+        for _, obj in ipairs(root:GetDescendants()) do
+            local n = lower(obj.Name)
+            for _, keyword in ipairs(wanted) do
+                if n == keyword or n:find(keyword, 1, true) then
+                    namedCount += 1
+                    add(obj.ClassName .. " | " .. fullNameSafe(obj) .. " | attrs=" .. relevantAttributes(obj))
+                    break
+                end
+            end
+            if namedCount >= 80 then break end
+        end
+        if namedCount >= 80 then break end
+    end
+    if namedCount == 0 then add("NONE MATCHED") end
+    add("")
+
+    local report = table.concat(lines, "\n")
+    lastDiagnosticReport = report
+    return report
+end
+
+local function copyDiagnosticReport()
+    local report = buildDiagnosticReport()
+    print(report)
+
+    local copied = false
+
+    if type(setclipboard) == "function" then
+        copied = pcall(setclipboard, report)
+    elseif type(toclipboard) == "function" then
+        copied = pcall(toclipboard, report)
+    end
+
+    return copied, report
 end
 
 
@@ -1218,7 +1558,7 @@ end
 
 local function createTab(name)
     local button = Instance.new("TextButton")
-    button.Size = UDim2.new(1/4, -6, 1, 0)
+    button.Size = UDim2.new(1/5, -6, 1, 0)
     button.BackgroundColor3 = Color3.fromRGB(20, 24, 34)
     button.BorderSizePixel = 0
     button.AutoButtonColor = true
@@ -1242,11 +1582,13 @@ createTab("Dashboard")
 createTab("Teleport")
 createTab("Tracker")
 createTab("Fishing")
+createTab("Debug")
 
 local dashboardPage = createPage("Dashboard")
 local teleportPage = createPage("Teleport")
 local trackerPage = createPage("Tracker")
 local fishingPage = createPage("Fishing")
+local debugPage = createPage("Debug")
 
 -- Shared GUI helpers
 local function createInfoRow(parent, y, labelText)
@@ -1388,6 +1730,72 @@ local scanFishButton = createActionButton(fishingPage, 0, 250, 1, "Scan / Select
 
 autoFishingButton.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
 autoFishingButton.TextColor3 = Color3.fromRGB(233, 198, 159)
+
+
+
+-- Debug ---------------------------------------------------------------------
+
+local debugInfo = Instance.new("TextLabel")
+debugInfo.BackgroundTransparency = 1
+debugInfo.Size = UDim2.new(1, 0, 0, 105)
+debugInfo.Font = Enum.Font.Gotham
+debugInfo.Text = "Calibration mode scans the live game structure.\n\nRun it while you are seated in your boat and can see fish nearby. Then copy the report and send it back to me."
+debugInfo.TextWrapped = true
+debugInfo.TextSize = 11
+debugInfo.TextColor3 = Color3.fromRGB(158, 166, 184)
+debugInfo.TextXAlignment = Enum.TextXAlignment.Left
+debugInfo.TextYAlignment = Enum.TextYAlignment.Top
+debugInfo.Parent = debugPage
+
+local runtimeStatus = createInfoRow(debugPage, 112, "Runtime Scan")
+runtimeStatus.Text = "Not scanned"
+
+local clawStatus = createInfoRow(debugPage, 151, "Claw Button")
+clawStatus.Text = "Unknown"
+
+local boatStatus = createInfoRow(debugPage, 190, "Player Boat")
+boatStatus.Text = "Unknown"
+
+local runDiagnosticsButton = createActionButton(debugPage, 0, 235, 0.49, "Scan Runtime")
+local copyDiagnosticsButton = createActionButton(debugPage, 0.51, 235, 0.49, "Copy Report")
+
+local function refreshDebugStatus()
+    local clawButton = findClawControlButton()
+    local boat, _, method = getPlayerBoat()
+
+    clawStatus.Text = clawButton and clawButton.Name or "Not found"
+    boatStatus.Text = boat and (boat.Name .. " • " .. tostring(method)) or "Not found"
+end
+
+runDiagnosticsButton.MouseButton1Click:Connect(function()
+    runDiagnosticsButton.Text = "Scanning..."
+
+    task.spawn(function()
+        local report = buildDiagnosticReport()
+        runtimeStatus.Text = tostring(#report) .. " chars"
+        refreshDebugStatus()
+        print(report)
+        setStatus("Runtime diagnostic complete • open console or Copy Report", "good")
+        task.wait(0.2)
+        runDiagnosticsButton.Text = "Scan Runtime"
+    end)
+end)
+
+copyDiagnosticsButton.MouseButton1Click:Connect(function()
+    local copied, report = copyDiagnosticReport()
+    runtimeStatus.Text = tostring(#report) .. " chars"
+
+    if copied then
+        setStatus("Diagnostic report copied to clipboard", "good")
+        copyDiagnosticsButton.Text = "Copied!"
+    else
+        setStatus("Clipboard unavailable • report printed to console", "warn")
+        copyDiagnosticsButton.Text = "Printed to Console"
+    end
+
+    task.wait(1.2)
+    copyDiagnosticsButton.Text = "Copy Report"
+end)
 
 
 -- Footer
@@ -1858,4 +2266,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Smart Fishing v1.2.4 loaded.")
+print("[DChronos Native] Claw Fishing Calibration v1.2.5 loaded.")
