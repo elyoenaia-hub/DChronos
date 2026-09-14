@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Network Radar v1.2.8
+    Edition: Core Flow Fix v1.2.9
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.2.8"
+local MODULE_VERSION = "1.2.9"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -48,6 +48,14 @@ end)
 local IS_TOUCH_DEVICE = UserInputService.TouchEnabled
 local HAS_KEYBOARD = UserInputService.KeyboardEnabled
 local MOBILE_SAFE_MODE = IS_TOUCH_DEVICE and not HAS_KEYBOARD
+
+-- Forward declarations used by Smart Fishing functions that are defined
+-- before the GUI is constructed. This avoids accidentally resolving these
+-- names as globals/nil in Luau.
+local gui
+local main
+local floatButton
+local setStatus
 
 local player = Players.LocalPlayer
 if not player then
@@ -89,6 +97,8 @@ local state = {
     fishing = {
         autoFishing = false,
         autoApproach = false,
+        autoApproachBusy = false,
+        lastApproachAt = 0,
         filterIndex = 1, -- Any until live species metadata is resolved
         currentTarget = nil,
         currentRarity = "Unknown",
@@ -1005,32 +1015,19 @@ local function looksLikeFish(instance)
 end
 
 local function getFishingOrigin()
-    local boat = nil
-    local character = player.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local noTouchy = Workspace:FindFirstChild("NoTouchy")
+    local boatsFolder = noTouchy and noTouchy:FindFirstChild("Boats")
+    local exactBoat = boatsFolder and boatsFolder:FindFirstChild(player.Name)
 
-    if humanoid then
-        for _, obj in ipairs(Workspace:GetDescendants()) do
-            if (obj:IsA("VehicleSeat") or obj:IsA("Seat"))
-                and obj.Occupant == humanoid then
-                local model = obj:FindFirstAncestorOfClass("Model")
-                if model then
-                    boat = model
-                    break
-                end
-            end
-        end
-    end
-
-    if boat then
-        local cf = getObjectCFrame(boat)
+    if exactBoat and exactBoat:IsA("Model") then
+        local cf = getObjectCFrame(exactBoat)
         if cf then
-            return cf.Position, boat
+            return cf.Position, exactBoat
         end
     end
 
     local _, root = getCharacter()
-    return root and root.Position or Vector3.new(), boat
+    return root and root.Position or Vector3.new(), nil
 end
 
 local function getPlayerBoat()
@@ -1265,7 +1262,7 @@ local function approachFishWithBoat(target)
         return false, "Network fish target unavailable"
     end
 
-    local boat = getPlayerBoat()
+    local boat, seat, boatMethod = getPlayerBoat()
     if not boat then
         return false, "Player boat was not found"
     end
@@ -1283,13 +1280,18 @@ local function approachFishWithBoat(target)
         fishPos.Z - currentPos.Z
     )
 
+    local distanceBefore = flatDirection.Magnitude
+
+    if distanceBefore <= 18 then
+        return true, "already-near", distanceBefore
+    end
+
     if flatDirection.Magnitude < 0.1 then
         flatDirection = Vector3.new(0, 0, -1)
     else
         flatDirection = flatDirection.Unit
     end
 
-    -- Stop a short distance from the fish so the claw has room to drop.
     local approachPosition = Vector3.new(
         fishPos.X,
         currentPos.Y,
@@ -1301,17 +1303,136 @@ local function approachFishWithBoat(target)
         Vector3.new(fishPos.X, currentPos.Y, fishPos.Z)
     )
 
+    local hull = boat:FindFirstChild("Hull", true)
+    local vehicleSeat = seat or boat:FindFirstChildWhichIsA("VehicleSeat", true)
+
+    local function zeroPhysics()
+        for _, part in ipairs({hull, vehicleSeat}) do
+            if part and part:IsA("BasePart") then
+                pcall(function()
+                    part.AssemblyLinearVelocity = Vector3.zero
+                    part.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+    end
+
     local ok, err = pcall(function()
-        boat:PivotTo(destination)
+        zeroPhysics()
+
+        -- Reinforce the local movement over a few frames. This is noticeably
+        -- more reliable on mobile than a single PivotTo call.
+        for _ = 1, 4 do
+            boat:PivotTo(destination)
+            zeroPhysics()
+            task.wait(0.08)
+        end
     end)
 
     if not ok then
         return false, tostring(err)
     end
 
-    return true
+    task.wait(0.12)
+
+    local after = getObjectCFrame(boat)
+    if not after then
+        return true, boatMethod or "moved", distanceBefore
+    end
+
+    local distanceAfter = Vector3.new(
+        fishPos.X - after.Position.X,
+        0,
+        fishPos.Z - after.Position.Z
+    ).Magnitude
+
+    -- Detect immediate server correction rather than pretending approach worked.
+    if distanceAfter > distanceBefore - 3 and distanceAfter > 22 then
+        return false,
+            string.format(
+                "boat movement was server-corrected (%.0f → %.0f studs)",
+                distanceBefore,
+                distanceAfter
+            ),
+            distanceAfter
+    end
+
+    return true,
+        string.format("%.0f → %.0f studs", distanceBefore, distanceAfter),
+        distanceAfter
 end
 
+
+
+local function gameButtonAtPoint(x, y)
+    local best = nil
+    local bestArea = math.huge
+    local bestZ = -math.huge
+
+    if not playerGui then
+        return nil
+    end
+
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if obj:IsA("GuiButton")
+            and obj.Visible
+            and gui
+            and not obj:IsDescendantOf(gui) then
+
+            local pos = obj.AbsolutePosition
+            local size = obj.AbsoluteSize
+
+            if x >= pos.X
+                and x <= pos.X + size.X
+                and y >= pos.Y
+                and y <= pos.Y + size.Y then
+
+                local area = math.max(1, size.X * size.Y)
+                local z = obj.ZIndex
+
+                if z > bestZ or (z == bestZ and area < bestArea) then
+                    best = obj
+                    bestArea = area
+                    bestZ = z
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function activateCalibratedButton(button)
+    if not button or not button.Parent then
+        return false, "calibrated button is no longer available"
+    end
+
+    local activated = false
+
+    local ok = pcall(function()
+        button:Activate()
+        activated = true
+    end)
+
+    if activated and ok then
+        return true, "GuiButton:Activate"
+    end
+
+    if type(firesignal) == "function" then
+        local fired = false
+
+        pcall(function()
+            firesignal(button.Activated)
+            fired = true
+        end)
+
+        if fired then
+            return true, "firesignal(Activated)"
+        end
+    end
+
+    return false, "button activation unavailable"
+end
 
 local macroConnections = {}
 
@@ -1360,11 +1481,18 @@ local function beginMobileGestureCalibration()
             local key = tostring(input)
             activeTouches[key] = true
 
+            local buttonRef = gameButtonAtPoint(
+                input.Position.X,
+                input.Position.Y
+            )
+
             table.insert(state.mobileMacro.events, {
                 t = elapsed,
                 state = Enum.UserInputState.Begin.Value,
                 x = input.Position.X,
                 y = input.Position.Y,
+                buttonRef = buttonRef,
+                buttonPath = buttonRef and fullNameSafe(buttonRef) or nil,
             })
         end
     end))
@@ -1439,10 +1567,6 @@ local function playMobileGesture()
         return false, "Run Mobile Gesture Calibration first"
     end
 
-    if not VirtualInputManager then
-        return false, "VirtualInputManager unavailable in this executor"
-    end
-
     local events = state.mobileMacro.events
     if #events == 0 then
         return false, "Recorded gesture is empty"
@@ -1450,6 +1574,8 @@ local function playMobileGesture()
 
     local previousTime = 0
     local touchId = 1
+    local activatedButtons = 0
+    local syntheticTouches = 0
 
     for _, event in ipairs(events) do
         local delay = math.max(0, (event.t or 0) - previousTime)
@@ -1457,23 +1583,53 @@ local function playMobileGesture()
             task.wait(delay)
         end
 
-        local ok, err = pcall(function()
-            VirtualInputManager:SendTouchEvent(
-                touchId,
-                tonumber(event.state) or Enum.UserInputState.Begin.Value,
-                tonumber(event.x) or 0,
-                tonumber(event.y) or 0
-            )
-        end)
+        local handled = false
 
-        if not ok then
-            return false, tostring(err)
+        -- For a touch that began on a real game GuiButton, prefer directly
+        -- activating that button. This is far more reliable on iPad executors
+        -- than synthesizing an OS-like touch.
+        if event.state == Enum.UserInputState.Begin.Value
+            and event.buttonRef
+            and event.buttonRef.Parent then
+
+            local ok = activateCalibratedButton(event.buttonRef)
+            if ok then
+                activatedButtons += 1
+                handled = true
+            end
+        end
+
+        if not handled then
+            if not VirtualInputManager then
+                return false,
+                    "VirtualInputManager unavailable and no calibrated GuiButton matched"
+            end
+
+            local ok, err = pcall(function()
+                VirtualInputManager:SendTouchEvent(
+                    touchId,
+                    tonumber(event.state) or Enum.UserInputState.Begin.Value,
+                    tonumber(event.x) or 0,
+                    tonumber(event.y) or 0
+                )
+            end)
+
+            if not ok then
+                return false, tostring(err)
+            end
+
+            syntheticTouches += 1
         end
 
         previousTime = event.t or previousTime
     end
 
-    return true, "mobile-gesture"
+    return true,
+        string.format(
+            "mobile replay • buttons=%d touches=%d",
+            activatedButtons,
+            syntheticTouches
+        )
 end
 
 
@@ -1671,16 +1827,8 @@ local function runAutoFishingCycle()
     end
 
     if state.fishing.autoApproach then
-        local ok, message = approachFishWithBoat(target)
-
-        if not ok then
-            setStatus("Auto Approach: " .. tostring(message), "warn")
-            state.fishing.busy = false
-            return
-        end
-
-        task.wait(0.65)
-
+        -- Auto Approach now runs in its own loop. Refresh the live target and
+        -- wait until it is actually within claw range before fishing.
         local liveFish = state.fishing.networkFish[target.id]
         local livePos = liveFish and getNetworkFishPosition(liveFish)
 
@@ -1721,6 +1869,11 @@ local function runAutoFishingCycle()
         state.fishing.busy = false
         return
     end
+
+    setStatus(
+        "Claw input sent • " .. tostring(message),
+        "good"
+    )
 
     -- Passive confirmation: FishUpdate "freeze" names the catcher and caught fish id.
     local waitStart = os.clock()
@@ -2326,12 +2479,12 @@ end
 
 -- GUI -----------------------------------------------------------------------
 
-local gui = Instance.new("ScreenGui")
+gui = Instance.new("ScreenGui")
 gui.Name = "DChronosClawFishing"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 
-local floatButton = Instance.new("TextButton")
+floatButton = Instance.new("TextButton")
 floatButton.Name = "FloatingToggle"
 floatButton.AnchorPoint = Vector2.new(0, 0.5)
 floatButton.Position = UDim2.new(0, 18, 0.5, 0)
@@ -2356,11 +2509,11 @@ floatStroke.Color = Color3.fromRGB(83, 94, 122)
 floatStroke.Thickness = 1
 floatStroke.Parent = floatButton
 
-local main = Instance.new("Frame")
+main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0, 0.5)
 main.Position = UDim2.new(0, 24, 0.5, 0)
-main.Size = UDim2.fromOffset(430, 575)
+main.Size = UDim2.fromOffset(430, 645)
 main.BackgroundColor3 = Color3.fromRGB(10, 13, 20)
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -2462,7 +2615,7 @@ local statusCorner = Instance.new("UICorner")
 statusCorner.CornerRadius = UDim.new(0, 8)
 statusCorner.Parent = statusBanner
 
-local function setStatus(text, tone)
+setStatus = function(text, tone)
     statusBanner.Text = text
 
     if tone == "good" then
@@ -2502,7 +2655,7 @@ local function createPage(name)
     page.Name = name .. "Page"
     page.BackgroundTransparency = 1
     page.Position = UDim2.fromOffset(20, 181)
-    page.Size = UDim2.new(1, -40, 0, 340)
+    page.Size = UDim2.new(1, -40, 0, 410)
     page.Visible = false
     page.Parent = main
     pages[name] = page
@@ -2699,6 +2852,8 @@ local autoFishingButton = createActionButton(fishingPage, 0, 205, 0.49, "Auto Fi
 local autoApproachButton = createActionButton(fishingPage, 0.51, 205, 0.49, "Auto Approach: OFF")
 local scanFishButton = createActionButton(fishingPage, 0, 250, 1, "Scan / Select Fish Target")
 local calibrateGestureButton = createActionButton(fishingPage, 0, 295, 1, "Calibrate iPad Claw Gesture (13s)")
+local testApproachButton = createActionButton(fishingPage, 0, 340, 0.49, "Test Approach Now")
+local testClawButton = createActionButton(fishingPage, 0.51, 340, 0.49, "Test Claw Input")
 
 autoFishingButton.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
 autoFishingButton.TextColor3 = Color3.fromRGB(233, 198, 159)
@@ -3128,6 +3283,55 @@ end)
 
 
 
+
+testApproachButton.MouseButton1Click:Connect(function()
+    testApproachButton.Text = "Moving..."
+
+    task.spawn(function()
+        local target = scanFishTarget()
+        updateFishHighlight(target)
+
+        if not target then
+            setStatus("Test Approach: no network fish target", "warn")
+            testApproachButton.Text = "Test Approach Now"
+            return
+        end
+
+        local ok, message, distance = approachFishWithBoat(target)
+
+        if ok then
+            setStatus(
+                "Test Approach OK • "
+                    .. tostring(message)
+                    .. (distance and (" • " .. string.format("%.0f studs", distance)) or ""),
+                "good"
+            )
+        else
+            setStatus("Test Approach failed: " .. tostring(message), "bad")
+        end
+
+        task.wait(0.7)
+        testApproachButton.Text = "Test Approach Now"
+    end)
+end)
+
+testClawButton.MouseButton1Click:Connect(function()
+    testClawButton.Text = "Testing..."
+
+    task.spawn(function()
+        local ok, message = sendClawInput()
+
+        if ok then
+            setStatus("Test Claw OK • " .. tostring(message), "good")
+        else
+            setStatus("Test Claw failed: " .. tostring(message), "bad")
+        end
+
+        task.wait(0.9)
+        testClawButton.Text = "Test Claw Input"
+    end)
+end)
+
 calibrateGestureButton.MouseButton1Click:Connect(function()
     calibrateGestureButton.Text = "Recording... perform ONE normal catch"
 
@@ -3370,6 +3574,58 @@ end)
 
 task.spawn(function()
     while gui.Parent do
+        task.wait(0.45)
+
+        if state.fishing.autoApproach
+            and not state.fishing.autoApproachBusy
+            and os.clock() - state.fishing.lastApproachAt >= 1.25 then
+
+            state.fishing.autoApproachBusy = true
+            state.fishing.lastApproachAt = os.clock()
+
+            local ok, err = pcall(function()
+                local target = scanFishTarget()
+
+                if not target then
+                    setStatus("Auto Approach: waiting for network fish", "warn")
+                    return
+                end
+
+                updateFishHighlight(target)
+
+                local moved, message, distance = approachFishWithBoat(target)
+
+                if moved then
+                    if distance and distance <= 18 then
+                        setStatus(
+                            "Auto Approach ready • target within claw range",
+                            "good"
+                        )
+                    else
+                        setStatus(
+                            "Auto Approach • " .. tostring(message),
+                            "good"
+                        )
+                    end
+                else
+                    setStatus(
+                        "Auto Approach failed: " .. tostring(message),
+                        "bad"
+                    )
+                end
+            end)
+
+            if not ok then
+                setStatus("Auto Approach error: " .. tostring(err), "bad")
+            end
+
+            state.fishing.autoApproachBusy = false
+        end
+    end
+end)
+
+task.spawn(function()
+    while gui.Parent do
         task.wait(0.55)
 
         if state.fishing.autoFishing then
@@ -3378,4 +3634,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Network Radar v1.2.8 loaded.")
+print("[DChronos Native] Claw Fishing Core Flow Fix v1.2.9 loaded.")
