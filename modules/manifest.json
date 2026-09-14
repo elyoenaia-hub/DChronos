@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "loaderVersion": "1.0.0",
+  "baseUrl": "https://raw.githubusercontent.com/elyoenaia-hub/DChronos/main/modules/",
+  "modules": [
+    {
+      "name": "Example Module",
+      "enabled": false,
+      "creatorId": 0,
+      "creatorFallback": false,
+      "placeIds": [],
+      "universeIds": [],
+      "file": "example.lua"
+    }
+  ]
+}
