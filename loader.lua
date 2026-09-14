@@ -1,215 +1,435 @@
--- DChronos Loader v1.1.0 — Bridge Edition
--- Supports internal DChronos modules and attributed external module URLs.
+--[[
+    DChronos Loader v1.2.1 — Native Edition
 
-if not game:IsLoaded() then game.Loaded:Wait() end
+    No third-party module bridge.
+    Registry metadata is local to DChronos.
+    Modules are loaded only from:
+      https://raw.githubusercontent.com/elyoenaia-hub/DChronos/main/modules/
 
-local VERSION = "1.1.0"
-local ROOT = "https://raw.githubusercontent.com/elyoenaia-hub/DChronos/main/"
-local MANIFEST_URL = ROOT .. "modules/manifest.json"
+    Resolution priority:
+      1. PlaceId
+      2. UniverseId (game.GameId)
+      3. CreatorId fallback
+]]
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local VERSION = "1.2.1"
+local REPO_OWNER = "elyoenaia-hub"
+local REPO_NAME = "DChronos"
+local BRANCH = "main"
+
+local RAW_ROOT = string.format(
+    "https://raw.githubusercontent.com/%s/%s/%s/",
+    REPO_OWNER,
+    REPO_NAME,
+    BRANCH
+)
+
+local MANIFEST_URL = RAW_ROOT .. "modules/manifest.json"
+
 local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
-local player = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer
+
 local env = (type(getgenv) == "function" and getgenv()) or _G
 
 if env.__DCHRONOS_RUNNING then
-    warn("[DChronos] Already running")
+    warn("[DChronos] Loader is already running.")
     return
 end
+
 env.__DCHRONOS_RUNNING = true
 
-local gui, statusLabel, detailLabel, fill
+local gui
+local statusLabel
+local detailLabel
+local progressFill
+local sourceLabel
 
-local function finish()
+local function cleanup()
     env.__DCHRONOS_RUNNING = nil
 end
 
-local function makeGui()
-    if not player then return end
-    local pg = player:FindFirstChildOfClass("PlayerGui") or player:WaitForChild("PlayerGui", 10)
-    if not pg then return end
+local function destroyGui(delaySeconds)
+    if not gui then return end
+
+    task.delay(delaySeconds or 2, function()
+        pcall(function()
+            if gui then
+                gui:Destroy()
+            end
+        end)
+    end)
+end
+
+local function createGui()
+    if not LocalPlayer then return end
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        or LocalPlayer:WaitForChild("PlayerGui", 10)
+
+    if not playerGui then return end
 
     gui = Instance.new("ScreenGui")
-    gui.Name = "DChronosLoader"
+    gui.Name = "DChronosNativeLoader"
     gui.IgnoreGuiInset = true
     gui.ResetOnSpawn = false
 
     local frame = Instance.new("Frame")
-    frame.AnchorPoint = Vector2.new(.5,.5)
-    frame.Position = UDim2.fromScale(.5,.5)
-    frame.Size = UDim2.fromOffset(460,190)
-    frame.BackgroundColor3 = Color3.fromRGB(12,14,20)
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.Position = UDim2.fromScale(0.5, 0.5)
+    frame.Size = UDim2.fromOffset(470, 215)
+    frame.BackgroundColor3 = Color3.fromRGB(10, 12, 18)
     frame.BorderSizePixel = 0
     frame.Parent = gui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0,16)
 
-    local stroke = Instance.new("UIStroke", frame)
-    stroke.Color = Color3.fromRGB(62,68,82)
+    local frameCorner = Instance.new("UICorner")
+    frameCorner.CornerRadius = UDim.new(0, 16)
+    frameCorner.Parent = frame
 
-    local title = Instance.new("TextLabel", frame)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(60, 66, 82)
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
     title.BackgroundTransparency = 1
-    title.Position = UDim2.fromOffset(24,18)
-    title.Size = UDim2.new(1,-48,0,30)
+    title.Position = UDim2.fromOffset(24, 18)
+    title.Size = UDim2.new(1, -48, 0, 30)
     title.Font = Enum.Font.GothamBold
     title.Text = "DCHRONOS"
-    title.TextSize = 23
-    title.TextColor3 = Color3.fromRGB(245,247,255)
+    title.TextSize = 24
+    title.TextColor3 = Color3.fromRGB(246, 248, 255)
     title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
 
-    local ver = Instance.new("TextLabel", frame)
-    ver.BackgroundTransparency = 1
-    ver.Position = UDim2.fromOffset(24,47)
-    ver.Size = UDim2.new(1,-48,0,18)
-    ver.Font = Enum.Font.Gotham
-    ver.Text = "Bridge Edition  •  v" .. VERSION
-    ver.TextSize = 11
-    ver.TextColor3 = Color3.fromRGB(125,132,150)
-    ver.TextXAlignment = Enum.TextXAlignment.Left
+    local version = Instance.new("TextLabel")
+    version.BackgroundTransparency = 1
+    version.Position = UDim2.fromOffset(24, 47)
+    version.Size = UDim2.new(1, -48, 0, 18)
+    version.Font = Enum.Font.Gotham
+    version.Text = "Native Edition  •  v" .. VERSION
+    version.TextSize = 11
+    version.TextColor3 = Color3.fromRGB(125, 132, 150)
+    version.TextXAlignment = Enum.TextXAlignment.Left
+    version.Parent = frame
 
-    statusLabel = Instance.new("TextLabel", frame)
+    sourceLabel = Instance.new("TextLabel")
+    sourceLabel.BackgroundTransparency = 1
+    sourceLabel.AnchorPoint = Vector2.new(1, 0)
+    sourceLabel.Position = UDim2.new(1, -24, 0, 22)
+    sourceLabel.Size = UDim2.fromOffset(120, 24)
+    sourceLabel.Font = Enum.Font.GothamMedium
+    sourceLabel.Text = "NATIVE"
+    sourceLabel.TextSize = 11
+    sourceLabel.TextColor3 = Color3.fromRGB(155, 240, 178)
+    sourceLabel.TextXAlignment = Enum.TextXAlignment.Right
+    sourceLabel.Parent = frame
+
+    statusLabel = Instance.new("TextLabel")
     statusLabel.BackgroundTransparency = 1
-    statusLabel.Position = UDim2.fromOffset(24,78)
-    statusLabel.Size = UDim2.new(1,-48,0,24)
+    statusLabel.Position = UDim2.fromOffset(24, 82)
+    statusLabel.Size = UDim2.new(1, -48, 0, 24)
     statusLabel.Font = Enum.Font.GothamMedium
     statusLabel.Text = "Initializing..."
-    statusLabel.TextSize = 15
-    statusLabel.TextColor3 = Color3.fromRGB(220,224,235)
+    statusLabel.TextSize = 16
+    statusLabel.TextColor3 = Color3.fromRGB(222, 226, 237)
     statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.Parent = frame
 
-    detailLabel = Instance.new("TextLabel", frame)
+    detailLabel = Instance.new("TextLabel")
     detailLabel.BackgroundTransparency = 1
-    detailLabel.Position = UDim2.fromOffset(24,105)
-    detailLabel.Size = UDim2.new(1,-48,0,38)
+    detailLabel.Position = UDim2.fromOffset(24, 111)
+    detailLabel.Size = UDim2.new(1, -48, 0, 55)
     detailLabel.Font = Enum.Font.Gotham
-    detailLabel.Text = "Preparing DChronos..."
+    detailLabel.Text = "Preparing DChronos Native..."
     detailLabel.TextSize = 12
     detailLabel.TextWrapped = true
-    detailLabel.TextColor3 = Color3.fromRGB(145,151,168)
+    detailLabel.TextColor3 = Color3.fromRGB(145, 151, 168)
     detailLabel.TextXAlignment = Enum.TextXAlignment.Left
     detailLabel.TextYAlignment = Enum.TextYAlignment.Top
+    detailLabel.Parent = frame
 
-    local bar = Instance.new("Frame", frame)
-    bar.Position = UDim2.fromOffset(24,158)
-    bar.Size = UDim2.new(1,-48,0,7)
-    bar.BackgroundColor3 = Color3.fromRGB(37,41,52)
+    local bar = Instance.new("Frame")
+    bar.Position = UDim2.fromOffset(24, 181)
+    bar.Size = UDim2.new(1, -48, 0, 7)
+    bar.BackgroundColor3 = Color3.fromRGB(37, 41, 52)
     bar.BorderSizePixel = 0
-    Instance.new("UICorner", bar).CornerRadius = UDim.new(1,0)
+    bar.Parent = frame
 
-    fill = Instance.new("Frame", bar)
-    fill.Size = UDim2.fromScale(.04,1)
-    fill.BackgroundColor3 = Color3.fromRGB(235,238,248)
-    fill.BorderSizePixel = 0
-    Instance.new("UICorner", fill).CornerRadius = UDim.new(1,0)
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(1, 0)
+    barCorner.Parent = bar
 
-    gui.Parent = pg
+    progressFill = Instance.new("Frame")
+    progressFill.Size = UDim2.fromScale(0.04, 1)
+    progressFill.BackgroundColor3 = Color3.fromRGB(235, 238, 248)
+    progressFill.BorderSizePixel = 0
+    progressFill.Parent = bar
+
+    local progressCorner = Instance.new("UICorner")
+    progressCorner.CornerRadius = UDim.new(1, 0)
+    progressCorner.Parent = progressFill
+
+    gui.Parent = playerGui
 end
 
-local function setStatus(s, d, p)
-    print("[DChronos]", s, d or "")
-    if statusLabel then statusLabel.Text = s end
-    if detailLabel and d then detailLabel.Text = d end
-    if fill and p then
-        fill:TweenSize(UDim2.fromScale(math.clamp(p,.04,1),1), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, .2, true)
+local function setStatus(status, detail, progress)
+    print("[DChronos Native]", status, detail or "")
+
+    if statusLabel then statusLabel.Text = status end
+    if detailLabel and detail then detailLabel.Text = detail end
+
+    if progressFill and progress then
+        progressFill:TweenSize(
+            UDim2.fromScale(math.clamp(progress, 0.04, 1), 1),
+            Enum.EasingDirection.Out,
+            Enum.EasingStyle.Quad,
+            0.2,
+            true
+        )
     end
 end
 
-local function fail(msg)
-    warn("[DChronos]", msg)
-    setStatus("Unable to load", tostring(msg), 1)
-    if statusLabel then statusLabel.TextColor3 = Color3.fromRGB(255,145,145) end
-    finish()
+local function finishWith(status, detail, color, delaySeconds)
+    setStatus(status, detail, 1)
+
+    if statusLabel and color then
+        statusLabel.TextColor3 = color
+    end
+
+    cleanup()
+    destroyGui(delaySeconds or 3)
 end
 
-local function httpGet(url, tries)
-    local err = "unknown error"
-    for i=1,(tries or 3) do
-        local ok, res = pcall(function() return game:HttpGet(url) end)
-        if ok and type(res)=="string" and #res>0 and not res:find("404: Not Found",1,true) then return res end
-        err = tostring(res)
-        if i < (tries or 3) then task.wait(.65*i) end
-    end
-    return nil, err
+local function fail(message)
+    warn("[DChronos Native]", message)
+    finishWith(
+        "Unable to load",
+        tostring(message),
+        Color3.fromRGB(255, 145, 145),
+        4
+    )
 end
 
-local function contains(t, n)
-    if type(t) ~= "table" then return false end
-    n = tonumber(n)
-    for _,v in ipairs(t) do if tonumber(v)==n then return true end end
-    return false
-end
+local function httpGet(url, retries)
+    local lastError = "unknown error"
+    local attempts = retries or 3
 
-local function resolve(m)
-    for _,e in ipairs(m.modules or {}) do
-        if e.enabled ~= false and contains(e.placeIds, game.PlaceId) then return e,"PlaceId" end
-    end
-    for _,e in ipairs(m.modules or {}) do
-        if e.enabled ~= false and contains(e.universeIds, game.GameId) then return e,"UniverseId" end
-    end
-    local hits = {}
-    for _,e in ipairs(m.modules or {}) do
-        if e.enabled ~= false and e.creatorFallback ~= false and tonumber(e.creatorId)==tonumber(game.CreatorId) then
-            table.insert(hits,e)
+    for attempt = 1, attempts do
+        local ok, result = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        if ok
+            and type(result) == "string"
+            and #result > 0
+            and not result:find("404: Not Found", 1, true) then
+            return result
+        end
+
+        lastError = tostring(result)
+
+        if attempt < attempts then
+            task.wait(0.65 * attempt)
         end
     end
-    if #hits==1 then return hits[1],"CreatorId" end
-    if #hits>1 then return nil,"Ambiguous CreatorId: "..tostring(game.CreatorId) end
-    return nil,"Unsupported game"
+
+    return nil, lastError
 end
 
-local function host(url)
-    return type(url)=="string" and url:match("^https://([^/]+)/") or nil
-end
+local function containsId(list, target)
+    if type(list) ~= "table" then return false end
 
-local function allowedHost(m,url)
-    local h=host(url)
-    if not h then return false end
-    for _,v in ipairs(m.allowedExternalHosts or {}) do if tostring(v)==h then return true end end
+    target = tonumber(target)
+
+    for _, value in ipairs(list) do
+        if tonumber(value) == target then
+            return true
+        end
+    end
+
     return false
 end
 
-local function moduleUrl(m,e)
-    local source = tostring(e.source or "internal"):lower()
-    if source=="external" then
-        if type(e.url)~="string" or not e.url:match("^https://") then return nil,"Invalid external URL" end
-        if not allowedHost(m,e.url) then return nil,"External host not allowed" end
-        return e.url,"External"
+local function resolveModule(manifest)
+    local placeId = tonumber(game.PlaceId)
+    local universeId = tonumber(game.GameId)
+    local creatorId = tonumber(game.CreatorId)
+
+    for _, entry in ipairs(manifest.modules or {}) do
+        if entry.enabled ~= false and containsId(entry.placeIds, placeId) then
+            return entry, "PlaceId"
+        end
     end
-    if type(e.file)~="string" or e.file=="" or e.file:find("..",1,true) or e.file:match("^https?://") then
-        return nil,"Invalid internal path"
+
+    for _, entry in ipairs(manifest.modules or {}) do
+        if entry.enabled ~= false and containsId(entry.universeIds, universeId) then
+            return entry, "UniverseId"
+        end
     end
-    return (m.internalBaseUrl or (ROOT.."modules/"))..e.file,"Internal"
+
+    local matches = {}
+
+    for _, entry in ipairs(manifest.modules or {}) do
+        if entry.enabled ~= false
+            and entry.creatorFallback ~= false
+            and tonumber(entry.creatorId) == creatorId then
+            table.insert(matches, entry)
+        end
+    end
+
+    if #matches == 1 then
+        return matches[1], "CreatorId"
+    end
+
+    if #matches > 1 then
+        return nil, "Ambiguous CreatorId: " .. tostring(creatorId)
+    end
+
+    return nil, "Game is not in the DChronos registry"
 end
 
-makeGui()
-setStatus("Loading registry...", "Fetching DChronos manifest", .16)
+local function validRelativeFile(file)
+    if type(file) ~= "string" or file == "" then return false end
+    if file:find("..", 1, true) then return false end
+    if file:match("^https?://") then return false end
+    return true
+end
 
-local body,err=httpGet(MANIFEST_URL,3)
-if not body then fail("Manifest download failed: "..tostring(err)); return end
+createGui()
 
-local ok,m=pcall(function() return HttpService:JSONDecode(body) end)
-if not ok or type(m)~="table" or type(m.modules)~="table" then fail("Manifest JSON is invalid"); return end
+setStatus(
+    "Loading native registry...",
+    "Fetching DChronos modules/manifest.json",
+    0.16
+)
 
-setStatus("Detecting game...", "PlaceId "..tostring(game.PlaceId).." • UniverseId "..tostring(game.GameId), .40)
-local e,matched=resolve(m)
-if not e then fail(matched.." • CreatorId "..tostring(game.CreatorId)); return end
+local manifestSource, manifestError = httpGet(MANIFEST_URL, 3)
 
-local url,source=moduleUrl(m,e)
-if not url then fail(source); return end
+if not manifestSource then
+    fail("Manifest download failed: " .. tostring(manifestError))
+    return
+end
 
-setStatus("Module detected", tostring(e.name or e.file or "Unnamed").." • "..source.." • "..matched, .62)
-if source=="External" then print("[DChronos] Upstream:", tostring(e.upstream or host(url) or "unknown")) end
+local decodeOk, manifest = pcall(function()
+    return HttpService:JSONDecode(manifestSource)
+end)
 
-setStatus("Downloading module...", source.." source", .80)
-local src,downloadErr=httpGet(url,3)
-if not src then fail("Module download failed: "..tostring(downloadErr)); return end
-if type(loadstring)~="function" then fail("loadstring unavailable"); return end
+if not decodeOk
+    or type(manifest) ~= "table"
+    or type(manifest.modules) ~= "table" then
+    fail("Manifest JSON is invalid.")
+    return
+end
 
-setStatus("Starting...", tostring(e.name or e.file or "Module"), .93)
-local fn,compileErr=loadstring(src, "@DChronos/"..source.."/"..tostring(e.upstreamFile or e.file or "module.lua"))
-if not fn then fail("Compile error: "..tostring(compileErr)); return end
-local ran,runtimeErr=pcall(fn)
-if not ran then fail("Runtime error: "..tostring(runtimeErr)); return end
+if tostring(manifest.edition or "") ~= "Native" then
+    fail("Manifest is not a DChronos Native manifest.")
+    return
+end
 
-setStatus("Loaded successfully", tostring(e.name or e.file or "Module").." • "..source, 1)
-if statusLabel then statusLabel.TextColor3=Color3.fromRGB(155,240,178) end
-finish()
-if gui then task.delay(1.4,function() pcall(function() gui:Destroy() end) end) end
+setStatus(
+    "Detecting game...",
+    "PlaceId " .. tostring(game.PlaceId)
+        .. " • UniverseId " .. tostring(game.GameId),
+    0.42
+)
+
+local entry, matchedBy = resolveModule(manifest)
+
+if not entry then
+    fail(
+        matchedBy
+        .. " • CreatorId "
+        .. tostring(game.CreatorId)
+    )
+    return
+end
+
+setStatus(
+    "Game recognized",
+    tostring(entry.name or entry.file or "Unknown")
+        .. " • matched by "
+        .. tostring(matchedBy),
+    0.64
+)
+
+-- Registry support and implementation support are intentionally separate.
+if entry.implemented ~= true then
+    finishWith(
+        "Native Module Pending",
+        tostring(entry.name or "This game")
+            .. " is registered in DChronos, but its native module has not been implemented yet.",
+        Color3.fromRGB(244, 204, 120),
+        5
+    )
+    return
+end
+
+if not validRelativeFile(entry.file) then
+    fail("Invalid DChronos module path.")
+    return
+end
+
+local baseUrl = manifest.internalBaseUrl
+    or (RAW_ROOT .. "modules/")
+
+local moduleUrl = baseUrl .. entry.file
+
+-- Enforce DChronos-only module hosting.
+local expectedPrefix = RAW_ROOT .. "modules/"
+if moduleUrl:sub(1, #expectedPrefix) ~= expectedPrefix then
+    fail("Native modules must be hosted inside the DChronos repository.")
+    return
+end
+
+setStatus(
+    "Downloading native module...",
+    tostring(entry.file),
+    0.80
+)
+
+local source, moduleError = httpGet(moduleUrl, 3)
+
+if not source then
+    fail("Native module download failed: " .. tostring(moduleError))
+    return
+end
+
+if type(loadstring) ~= "function" then
+    fail("loadstring is unavailable in this environment.")
+    return
+end
+
+setStatus(
+    "Starting native module...",
+    tostring(entry.name or entry.file),
+    0.93
+)
+
+local fn, compileError = loadstring(
+    source,
+    "@DChronos/modules/" .. entry.file
+)
+
+if not fn then
+    fail("Compile error: " .. tostring(compileError))
+    return
+end
+
+local ok, runtimeError = pcall(fn)
+
+if not ok then
+    fail("Runtime error: " .. tostring(runtimeError))
+    return
+end
+
+finishWith(
+    "Loaded successfully",
+    tostring(entry.name or entry.file) .. " • DChronos Native",
+    Color3.fromRGB(155, 240, 178),
+    1.5
+)
