@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "loaderVersion": "1.2.5",
+  "loaderVersion": "1.2.6",
   "project": "DChronos",
   "edition": "Native",
   "internalBaseUrl": "https://raw.githubusercontent.com/elyoenaia-hub/DChronos/main/modules/",
@@ -1394,7 +1394,7 @@
         10008606756
       ],
       "file": "claw-fishing.lua",
-      "status": "native-calibration"
+      "status": "native-protocol-recorder"
     },
     {
       "name": "Miniwar",

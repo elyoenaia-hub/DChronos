@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Calibration v1.2.5
+    Edition: Protocol Recorder v1.2.6
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.2.5"
+local MODULE_VERSION = "1.2.6"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -631,13 +631,14 @@ local function hasRelevantFishAttribute(instance)
         "speciesId", "SpeciesId", "species", "Species",
         "rarity", "Rarity", "FishRarity",
         "caught", "Caught", "activeFish", "ActiveFish",
-        "destination", "FishState",
+        "destination", "Destination", "FishState",
     }
 
     for _, attr in ipairs(names) do
         local ok, value = pcall(function()
             return instance:GetAttribute(attr)
         end)
+
         if ok and value ~= nil then
             return true
         end
@@ -646,47 +647,58 @@ local function hasRelevantFishAttribute(instance)
     return false
 end
 
-local function looksLikeFish(instance)
-    if not instance then
+local function isRuntimeFishCandidate(instance)
+    if not instance then return false end
+    if not (instance:IsA("Model") or instance:IsA("BasePart")) then return false end
+
+    local noTouchy = Workspace:FindFirstChild("NoTouchy")
+    if not noTouchy or not instance:IsDescendantOf(noTouchy) then
         return false
     end
 
-    if not (instance:IsA("Model") or instance:IsA("BasePart")) then
+    -- Explicitly reject known non-fish runtime branches.
+    local boatsFolder = noTouchy:FindFirstChild("Boats")
+    if boatsFolder and instance:IsDescendantOf(boatsFolder) then
         return false
     end
 
-    local n = lower(instance.Name)
     local path = lower(fullNameSafe(instance))
+    if path:find(".boats.", 1, true)
+        or path:find(".claw", 1, true)
+        or path:find(".crane", 1, true)
+        or path:find(".hull", 1, true) then
+        return false
+    end
 
-    -- Runtime structure clues used by the game.
     if hasRelevantFishAttribute(instance) then
         return true
     end
 
-    local ancestor = instance.Parent
-    for _ = 1, 4 do
-        if not ancestor then break end
-        if hasRelevantFishAttribute(ancestor) then
+    local current = instance.Parent
+    for _ = 1, 5 do
+        if not current or current == noTouchy then break end
+
+        if hasRelevantFishAttribute(current) then
             return true
         end
-        local an = lower(ancestor.Name)
-        if an == "fish"
-            or an == "fishstate"
-            or an == "activefish"
-            or an:find("activefish", 1, true) then
+
+        local n = lower(current.Name)
+        if n == "fishstate"
+            or n == "activefish"
+            or n == "active fish"
+            or n == "fishes"
+            or n == "fish" then
             return true
         end
-        ancestor = ancestor.Parent
+
+        current = current.Parent
     end
 
-    for _, keyword in ipairs(FISH_KEYWORDS) do
-        if n:find(keyword, 1, true) or path:find(keyword, 1, true) then
-            return true
-        end
-    end
+    return false
+end
 
-    local rank = readRarityFromObject(instance)
-    return rank ~= nil and rank > 0
+local function looksLikeFish(instance)
+    return isRuntimeFishCandidate(instance)
 end
 
 local function getFishingOrigin()
@@ -719,10 +731,20 @@ local function getFishingOrigin()
 end
 
 local function getPlayerBoat()
+    -- Runtime report confirmed this exact hierarchy in Claw Fishing.
+    local noTouchy = Workspace:FindFirstChild("NoTouchy")
+    local boatsFolder = noTouchy and noTouchy:FindFirstChild("Boats")
+    local exactBoat = boatsFolder and boatsFolder:FindFirstChild(player.Name)
+
+    if exactBoat and exactBoat:IsA("Model") then
+        local seat = exactBoat:FindFirstChildWhichIsA("VehicleSeat", true)
+            or exactBoat:FindFirstChildWhichIsA("Seat", true)
+        return exactBoat, seat, "Workspace.NoTouchy.Boats.<player>"
+    end
+
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 
-    -- Highest confidence: currently occupied seat.
     if humanoid then
         for _, obj in ipairs(Workspace:GetDescendants()) do
             if (obj:IsA("VehicleSeat") or obj:IsA("Seat"))
@@ -733,56 +755,6 @@ local function getPlayerBoat()
                 end
             end
         end
-    end
-
-    local best, bestScore = nil, -math.huge
-    local playerName = lower(player.Name)
-    local userId = tostring(player.UserId)
-
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") then
-            local name = lower(obj.Name)
-            local path = lower(fullNameSafe(obj))
-            local score = 0
-
-            if name:find("boat", 1, true)
-                or name:find("ship", 1, true)
-                or obj:FindFirstChild("Hull", true) then
-                score += 20
-            else
-                continue
-            end
-
-            for _, attrName in ipairs({"OwnerUserId", "ownerUserId", "Owner", "owner"}) do
-                local ok, value = pcall(function()
-                    return obj:GetAttribute(attrName)
-                end)
-                if ok and value ~= nil then
-                    if tostring(value) == userId or lower(value) == playerName then
-                        score += 150
-                    end
-                end
-            end
-
-            if path:find(playerName, 1, true) then
-                score += 60
-            end
-            if path:find(userId, 1, true) then
-                score += 60
-            end
-            if obj:FindFirstChild("Hull", true) then
-                score += 15
-            end
-
-            if score > bestScore then
-                best = obj
-                bestScore = score
-            end
-        end
-    end
-
-    if best and bestScore >= 20 then
-        return best, nil, "ownership-scan"
     end
 
     return nil, nil, "not-found"
@@ -979,21 +951,32 @@ local function findClawControlButton()
 
     for _, obj in ipairs(playerGui:GetDescendants()) do
         if obj:IsA("GuiButton") and obj.Visible then
+            -- Never allow DChronos' own controls to be detected as game controls.
+            if obj:IsDescendantOf(gui) then
+                continue
+            end
+
             local name = lower(obj.Name)
             local text = ""
+            local path = lower(fullNameSafe(obj))
 
             pcall(function()
                 text = lower(obj.Text)
             end)
 
-            local combined = name .. " " .. text
+            local combined = name .. " " .. text .. " " .. path
             local score = 0
 
-            if combined:find("claw", 1, true) then score += 120 end
-            if combined:find("grab", 1, true) then score += 90 end
-            if combined:find("lower", 1, true) then score += 80 end
-            if combined:find("catch", 1, true) then score += 55 end
-            if combined:find("fishing", 1, true) then score += 20 end
+            if combined:find("claw", 1, true) then score += 140 end
+            if combined:find("grab", 1, true) then score += 110 end
+            if combined:find("drop", 1, true) then score += 85 end
+            if combined:find("lower", 1, true) then score += 85 end
+            if combined:find("catch", 1, true) then score += 65 end
+            if combined:find("crane", 1, true) then score += 55 end
+
+            if obj:IsA("ImageButton") then
+                score += 4
+            end
 
             if score > bestScore and score > 0 then
                 best = obj
@@ -1191,6 +1174,271 @@ end
 
 
 
+
+-- Protocol Recorder -----------------------------------------------------------
+
+local protocolConnections = {}
+local recorderEnv = (type(getgenv) == "function" and getgenv()) or _G
+
+if type(recorderEnv.__DCHRONOS_CLAW_RECORDER) ~= "table" then
+    recorderEnv.__DCHRONOS_CLAW_RECORDER = {
+        enabled = false,
+        logs = {},
+        startedAt = 0,
+        hookInstalled = false,
+    }
+end
+
+local protocolState = recorderEnv.__DCHRONOS_CLAW_RECORDER
+
+local WATCHED_REMOTE_NAMES = {
+    DataUpdate = true,
+    FishUpdate = true,
+    Steer = true,
+    CatchFish = true,
+    CatchSuccess = true,
+    ConfirmCatch = true,
+    PullFish = true,
+    Teleport = true,
+    CrewCraneInput = true,
+    CrewCatchShow = true,
+    CrewSync = true,
+    WeatherTrigger = true,
+    WeatherState = true,
+}
+
+local function serializeProtocolValue(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+
+    if depth > 3 then
+        return "<max-depth>"
+    end
+
+    local valueType = typeof(value)
+
+    if valueType == "nil" then
+        return "nil"
+    elseif valueType == "string" then
+        local trimmed = value
+        if #trimmed > 220 then
+            trimmed = trimmed:sub(1, 220) .. "…"
+        end
+        return string.format("%q", trimmed)
+    elseif valueType == "number" or valueType == "boolean" then
+        return tostring(value)
+    elseif valueType == "Vector3" then
+        return string.format("Vector3(%.3f, %.3f, %.3f)", value.X, value.Y, value.Z)
+    elseif valueType == "Vector2" then
+        return string.format("Vector2(%.3f, %.3f)", value.X, value.Y)
+    elseif valueType == "CFrame" then
+        local p = value.Position
+        return string.format("CFrame(pos=%.3f, %.3f, %.3f)", p.X, p.Y, p.Z)
+    elseif valueType == "Instance" then
+        return "<" .. value.ClassName .. ":" .. fullNameSafe(value) .. ">"
+    elseif valueType == "EnumItem" then
+        return tostring(value)
+    elseif valueType == "table" then
+        if seen[value] then
+            return "<cycle>"
+        end
+
+        seen[value] = true
+        local parts = {}
+        local count = 0
+
+        for k, v in pairs(value) do
+            count += 1
+            if count > 30 then
+                table.insert(parts, "…")
+                break
+            end
+
+            table.insert(
+                parts,
+                "["
+                    .. serializeProtocolValue(k, depth + 1, seen)
+                    .. "]="
+                    .. serializeProtocolValue(v, depth + 1, seen)
+            )
+        end
+
+        seen[value] = nil
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+
+    return "<" .. valueType .. ":" .. tostring(value) .. ">"
+end
+
+local function protocolLog(direction, remote, args)
+    if not protocolState.enabled then
+        return
+    end
+
+    local remoteName = remote and remote.Name or "?"
+    if not WATCHED_REMOTE_NAMES[remoteName] then
+        return
+    end
+
+    local elapsed = os.clock() - protocolState.startedAt
+    local serializedArgs = {}
+
+    for i = 1, #args do
+        serializedArgs[i] = serializeProtocolValue(args[i], 0, {})
+    end
+
+    local line = string.format(
+        "[%07.3f] %s %s (%s) args=[%s]",
+        elapsed,
+        direction,
+        fullNameSafe(remote),
+        remote and remote.ClassName or "?",
+        table.concat(serializedArgs, ", ")
+    )
+
+    table.insert(protocolState.logs, line)
+
+    if #protocolState.logs > 500 then
+        table.remove(protocolState.logs, 1)
+    end
+end
+
+local function installOutgoingProtocolHook()
+    if protocolState.hookInstalled then
+        return true, "already-installed"
+    end
+
+    if type(hookmetamethod) ~= "function"
+        or type(getnamecallmethod) ~= "function"
+        or type(newcclosure) ~= "function" then
+        return false, "executor does not expose hookmetamethod/getnamecallmethod/newcclosure"
+    end
+
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+
+        if (method == "FireServer" or method == "InvokeServer")
+            and typeof(self) == "Instance"
+            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+            and self:IsDescendantOf(ReplicatedStorage) then
+
+            local current = recorderEnv.__DCHRONOS_CLAW_RECORDER
+            if current and current.enabled and WATCHED_REMOTE_NAMES[self.Name] then
+                protocolLog("OUT/" .. method, self, args)
+            end
+        end
+
+        return oldNamecall(self, ...)
+    end))
+
+    protocolState.hookInstalled = true
+    return true, "installed"
+end
+
+local function disconnectProtocolConnections()
+    for _, connection in ipairs(protocolConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(protocolConnections)
+end
+
+local function installIncomingProtocolListeners()
+    disconnectProtocolConnections()
+
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    if not events then
+        return 0
+    end
+
+    local count = 0
+
+    for _, remote in ipairs(events:GetDescendants()) do
+        if remote:IsA("RemoteEvent") and WATCHED_REMOTE_NAMES[remote.Name] then
+            local connection = remote.OnClientEvent:Connect(function(...)
+                protocolLog("IN/OnClientEvent", remote, {...})
+            end)
+
+            table.insert(protocolConnections, connection)
+            count += 1
+        end
+    end
+
+    return count
+end
+
+local function startProtocolRecording()
+    protocolState.logs = {}
+    protocolState.startedAt = os.clock()
+    protocolState.enabled = true
+
+    local hookOk, hookStatus = installOutgoingProtocolHook()
+    local listenerCount = installIncomingProtocolListeners()
+
+    table.insert(
+        protocolState.logs,
+        string.format(
+            "[000.000] RECORDER START hook=%s(%s) incomingListeners=%d",
+            tostring(hookOk),
+            tostring(hookStatus),
+            listenerCount
+        )
+    )
+
+    return hookOk, hookStatus, listenerCount
+end
+
+local function stopProtocolRecording()
+    protocolState.enabled = false
+end
+
+local function clearProtocolRecording()
+    protocolState.logs = {}
+    protocolState.startedAt = 0
+end
+
+local function buildProtocolReport()
+    local lines = {
+        "=== DChronos Claw Fishing Protocol Recording ===",
+        "ModuleVersion=" .. MODULE_VERSION,
+        "PlaceId=" .. tostring(game.PlaceId),
+        "UniverseId=" .. tostring(game.GameId),
+        "Player=" .. tostring(player.Name) .. " (" .. tostring(player.UserId) .. ")",
+        "BoatPath=Workspace.NoTouchy.Boats." .. tostring(player.Name),
+        "",
+        "[Recorded Traffic]",
+    }
+
+    if #protocolState.logs == 0 then
+        table.insert(lines, "NO TRAFFIC RECORDED")
+    else
+        for _, line in ipairs(protocolState.logs) do
+            table.insert(lines, line)
+        end
+    end
+
+    return table.concat(lines, "\n")
+end
+
+local function copyText(text)
+    if type(setclipboard) == "function" then
+        local ok = pcall(setclipboard, text)
+        if ok then return true end
+    end
+
+    if type(toclipboard) == "function" then
+        local ok = pcall(toclipboard, text)
+        if ok then return true end
+    end
+
+    print(text)
+    return false
+end
+
+
 -- Runtime Calibration / Diagnostics ------------------------------------------
 
 local lastDiagnosticReport = ""
@@ -1284,24 +1532,37 @@ local function buildDiagnosticReport()
     if remoteCount == 0 then add("NONE MATCHED") end
     add("")
 
-    add("[Fish Candidates]")
+    add("[NoTouchy Top-Level]")
+    local noTouchy = Workspace:FindFirstChild("NoTouchy")
+    if noTouchy then
+        for _, child in ipairs(noTouchy:GetChildren()) do
+            add(child.ClassName .. " | " .. fullNameSafe(child) .. " | attrs=" .. relevantAttributes(child))
+        end
+    else
+        add("Workspace.NoTouchy NOT FOUND")
+    end
+    add("")
+
+    add("[Runtime Fish Candidates]")
     local fishCount = 0
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if (obj:IsA("Model") or obj:IsA("BasePart")) and looksLikeFish(obj) then
-            fishCount += 1
-            local rank, rarity = readRarityFromObject(obj)
-            add(
-                string.format(
-                    "%02d | %s | %s | rarity=%s(%s) | attrs=%s",
-                    fishCount,
-                    obj.ClassName,
-                    fullNameSafe(obj),
-                    tostring(rarity),
-                    tostring(rank),
-                    relevantAttributes(obj)
+    if noTouchy then
+        for _, obj in ipairs(noTouchy:GetDescendants()) do
+            if (obj:IsA("Model") or obj:IsA("BasePart")) and isRuntimeFishCandidate(obj) then
+                fishCount += 1
+                local rank, rarity = readRarityFromObject(obj)
+                add(
+                    string.format(
+                        "%02d | %s | %s | rarity=%s(%s) | attrs=%s",
+                        fishCount,
+                        obj.ClassName,
+                        fullNameSafe(obj),
+                        tostring(rarity),
+                        tostring(rank),
+                        relevantAttributes(obj)
+                    )
                 )
-            )
-            if fishCount >= 35 then break end
+                if fishCount >= 60 then break end
+            end
         end
     end
     if fishCount == 0 then add("NONE MATCHED") end
@@ -1312,22 +1573,24 @@ local function buildDiagnosticReport()
     local wanted = {
         "activefish", "fishstate", "fishrarities", "rarities",
         "playerdata", "catchfish", "destination", "claw",
-        "hull", "events", "aquariums", "boat",
+        "hull", "aquariums", "boat", "species",
     }
 
-    for _, root in ipairs({Workspace, ReplicatedStorage, player}) do
-        for _, obj in ipairs(root:GetDescendants()) do
-            local n = lower(obj.Name)
-            for _, keyword in ipairs(wanted) do
-                if n == keyword or n:find(keyword, 1, true) then
-                    namedCount += 1
-                    add(obj.ClassName .. " | " .. fullNameSafe(obj) .. " | attrs=" .. relevantAttributes(obj))
-                    break
+    for _, root in ipairs({noTouchy, ReplicatedStorage, player}) do
+        if root then
+            for _, obj in ipairs(root:GetDescendants()) do
+                local n = lower(obj.Name)
+                for _, keyword in ipairs(wanted) do
+                    if n == keyword or n:find(keyword, 1, true) then
+                        namedCount += 1
+                        add(obj.ClassName .. " | " .. fullNameSafe(obj) .. " | attrs=" .. relevantAttributes(obj))
+                        break
+                    end
                 end
+                if namedCount >= 120 then break end
             end
-            if namedCount >= 80 then break end
         end
-        if namedCount >= 80 then break end
+        if namedCount >= 120 then break end
     end
     if namedCount == 0 then add("NONE MATCHED") end
     add("")
@@ -1389,7 +1652,7 @@ local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0, 0.5)
 main.Position = UDim2.new(0, 24, 0.5, 0)
-main.Size = UDim2.fromOffset(430, 520)
+main.Size = UDim2.fromOffset(430, 575)
 main.BackgroundColor3 = Color3.fromRGB(10, 13, 20)
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -1531,7 +1794,7 @@ local function createPage(name)
     page.Name = name .. "Page"
     page.BackgroundTransparency = 1
     page.Position = UDim2.fromOffset(20, 181)
-    page.Size = UDim2.new(1, -40, 0, 285)
+    page.Size = UDim2.new(1, -40, 0, 340)
     page.Visible = false
     page.Parent = main
     pages[name] = page
@@ -1759,6 +2022,59 @@ boatStatus.Text = "Unknown"
 local runDiagnosticsButton = createActionButton(debugPage, 0, 235, 0.49, "Scan Runtime")
 local copyDiagnosticsButton = createActionButton(debugPage, 0.51, 235, 0.49, "Copy Report")
 
+local protocolStartButton = createActionButton(debugPage, 0, 280, 0.32, "Record Catch")
+local protocolStopButton = createActionButton(debugPage, 0.34, 280, 0.32, "Stop")
+local protocolCopyButton = createActionButton(debugPage, 0.68, 280, 0.32, "Copy Protocol")
+
+protocolStartButton.BackgroundColor3 = Color3.fromRGB(24, 48, 36)
+protocolStartButton.TextColor3 = Color3.fromRGB(168, 237, 188)
+
+protocolStartButton.MouseButton1Click:Connect(function()
+    local hookOk, hookStatus, listenerCount = startProtocolRecording()
+
+    if hookOk then
+        setStatus(
+            "Protocol recording ON • manually catch ONE fish now",
+            "good"
+        )
+    else
+        setStatus(
+            "Incoming recorder ON; outgoing hook unavailable: " .. tostring(hookStatus),
+            "warn"
+        )
+    end
+
+    protocolStartButton.Text = "Recording..."
+    runtimeStatus.Text = tostring(listenerCount) .. " listeners"
+end)
+
+protocolStopButton.MouseButton1Click:Connect(function()
+    stopProtocolRecording()
+    protocolStartButton.Text = "Record Catch"
+    runtimeStatus.Text = tostring(#protocolState.logs) .. " events"
+    setStatus("Protocol recording stopped", "good")
+end)
+
+protocolCopyButton.MouseButton1Click:Connect(function()
+    stopProtocolRecording()
+    local report = buildProtocolReport()
+    local copied = copyText(report)
+
+    protocolStartButton.Text = "Record Catch"
+    runtimeStatus.Text = tostring(#protocolState.logs) .. " events"
+
+    if copied then
+        protocolCopyButton.Text = "Copied!"
+        setStatus("Protocol report copied", "good")
+    else
+        protocolCopyButton.Text = "Printed"
+        setStatus("Clipboard unavailable • protocol printed to console", "warn")
+    end
+
+    task.wait(1)
+    protocolCopyButton.Text = "Copy Protocol"
+end)
+
 local function refreshDebugStatus()
     local clawButton = findClawControlButton()
     local boat, _, method = getPlayerBoat()
@@ -1801,7 +2117,7 @@ end)
 -- Footer
 local closeButton = Instance.new("TextButton")
 closeButton.AnchorPoint = Vector2.new(0.5, 1)
-closeButton.Position = UDim2.new(0.5, 0, 1, -10)
+closeButton.Position = UDim2.new(0.5, 0, 1, -8)
 closeButton.Size = UDim2.new(1, -40, 0, 25)
 closeButton.BackgroundTransparency = 1
 closeButton.Font = Enum.Font.Gotham
@@ -2151,10 +2467,14 @@ minimize.MouseButton1Click:Connect(function()
 end)
 
 closeButton.MouseButton1Click:Connect(function()
+    stopProtocolRecording()
+    disconnectProtocolConnections()
+
     if fishHighlight then
         fishHighlight:Destroy()
         fishHighlight = nil
     end
+
     gui:Destroy()
 end)
 
@@ -2266,4 +2586,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Calibration v1.2.5 loaded.")
+print("[DChronos Native] Claw Fishing Protocol Recorder v1.2.6 loaded.")
