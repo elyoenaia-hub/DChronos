@@ -1,12 +1,18 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    PlaceId: 128931272139211
-    UniverseId: 10008606756
-    Creator/Group ID: 492855504
+    Edition: Advanced v1.2.2
 
-    This module is a DChronos-native diagnostics / session helper.
-    It does not load or depend on third-party module code.
+    Features:
+      - Floating DC toggle button
+      - Minimize / restore menu
+      - Live stats
+      - Workspace object scan
+      - Tsunami/wave warning monitor
+      - Auto refresh
+      - Draggable menu + floating toggle
+
+    This is a native DChronos utility module.
 ]]
 
 local EXPECTED_PLACE_ID = 128931272139211
@@ -19,8 +25,8 @@ if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
 end
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
 if not player then
@@ -36,18 +42,21 @@ if not playerGui then
     return
 end
 
-local existing = playerGui:FindFirstChild("DChronosClawFishing")
-if existing then
-    existing:Destroy()
+local old = playerGui:FindFirstChild("DChronosClawFishing")
+if old then
+    old:Destroy()
 end
 
 local state = {
     startedAt = os.clock(),
+    visible = true,
+    autoRefresh = true,
     scan = {
         fish = 0,
         claw = 0,
         boat = 0,
         aquarium = 0,
+        prompts = 0,
     },
     warning = "No tsunami warning detected",
 }
@@ -83,16 +92,14 @@ local function findValueByNames(names)
     local leaderstats = player:FindFirstChild("leaderstats")
     if leaderstats then
         for _, child in ipairs(leaderstats:GetChildren()) do
-            if lookup[string.lower(child.Name)]
-                and child:IsA("ValueBase") then
+            if lookup[string.lower(child.Name)] and child:IsA("ValueBase") then
                 return child.Value, child.Name
             end
         end
     end
 
     for _, child in ipairs(player:GetDescendants()) do
-        if lookup[string.lower(child.Name)]
-            and child:IsA("ValueBase") then
+        if lookup[string.lower(child.Name)] and child:IsA("ValueBase") then
             return child.Value, child.Name
         end
     end
@@ -106,6 +113,7 @@ local function scanWorkspace()
         claw = 0,
         boat = 0,
         aquarium = 0,
+        prompts = 0,
     }
 
     local ok, descendants = pcall(function()
@@ -123,19 +131,20 @@ local function scanWorkspace()
             counts.fish += 1
         end
 
-        if n:find("claw", 1, true)
-            or n:find("crane", 1, true) then
+        if n:find("claw", 1, true) or n:find("crane", 1, true) then
             counts.claw += 1
         end
 
-        if n:find("boat", 1, true)
-            or n:find("ship", 1, true) then
+        if n:find("boat", 1, true) or n:find("ship", 1, true) then
             counts.boat += 1
         end
 
-        if n:find("aquarium", 1, true)
-            or n:find("tank", 1, true) then
+        if n:find("aquarium", 1, true) or n:find("tank", 1, true) then
             counts.aquarium += 1
+        end
+
+        if instance:IsA("ProximityPrompt") then
+            counts.prompts += 1
         end
     end
 
@@ -143,8 +152,6 @@ local function scanWorkspace()
 end
 
 local function detectWarningText()
-    local best = nil
-
     for _, obj in ipairs(playerGui:GetDescendants()) do
         if (obj:IsA("TextLabel") or obj:IsA("TextButton"))
             and obj.Visible
@@ -155,27 +162,53 @@ local function detectWarningText()
 
             if lower:find("tsunami", 1, true)
                 or lower:find("wave", 1, true)
-                or lower:find("dead waters", 1, true) then
-                best = obj.Text
-                break
+                or lower:find("dead waters", 1, true)
+                or lower:find("storm", 1, true) then
+                return obj.Text
             end
         end
     end
 
-    return best or "No tsunami warning detected"
+    return "No tsunami warning detected"
 end
 
--- GUI
 local gui = Instance.new("ScreenGui")
 gui.Name = "DChronosClawFishing"
 gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 
+-- Floating toggle
+local floatButton = Instance.new("TextButton")
+floatButton.Name = "FloatingToggle"
+floatButton.AnchorPoint = Vector2.new(0, 0.5)
+floatButton.Position = UDim2.new(0, 18, 0.5, 0)
+floatButton.Size = UDim2.fromOffset(54, 54)
+floatButton.BackgroundColor3 = Color3.fromRGB(19, 24, 34)
+floatButton.BorderSizePixel = 0
+floatButton.AutoButtonColor = true
+floatButton.Font = Enum.Font.GothamBold
+floatButton.Text = "DC"
+floatButton.TextSize = 16
+floatButton.TextColor3 = Color3.fromRGB(242, 245, 255)
+floatButton.Visible = false
+floatButton.ZIndex = 20
+floatButton.Parent = gui
+
+local floatCorner = Instance.new("UICorner")
+floatCorner.CornerRadius = UDim.new(1, 0)
+floatCorner.Parent = floatButton
+
+local floatStroke = Instance.new("UIStroke")
+floatStroke.Color = Color3.fromRGB(83, 94, 122)
+floatStroke.Thickness = 1
+floatStroke.Parent = floatButton
+
+-- Main window
 local main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0, 0.5)
 main.Position = UDim2.new(0, 24, 0.5, 0)
-main.Size = UDim2.fromOffset(370, 405)
+main.Size = UDim2.fromOffset(392, 468)
 main.BackgroundColor3 = Color3.fromRGB(10, 13, 20)
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -184,20 +217,21 @@ local mainCorner = Instance.new("UICorner")
 mainCorner.CornerRadius = UDim.new(0, 16)
 mainCorner.Parent = main
 
-local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(58, 66, 84)
-stroke.Thickness = 1
-stroke.Parent = main
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(58, 66, 84)
+mainStroke.Thickness = 1
+mainStroke.Parent = main
 
+-- Header
 local header = Instance.new("Frame")
 header.BackgroundTransparency = 1
-header.Position = UDim2.fromOffset(20, 16)
-header.Size = UDim2.new(1, -40, 0, 56)
+header.Position = UDim2.fromOffset(20, 14)
+header.Size = UDim2.new(1, -40, 0, 62)
 header.Parent = main
 
 local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
-title.Size = UDim2.new(1, -70, 0, 27)
+title.Size = UDim2.new(1, -110, 0, 27)
 title.Font = Enum.Font.GothamBold
 title.Text = "DCHRONOS"
 title.TextSize = 21
@@ -208,9 +242,9 @@ title.Parent = header
 local subtitle = Instance.new("TextLabel")
 subtitle.BackgroundTransparency = 1
 subtitle.Position = UDim2.fromOffset(0, 28)
-subtitle.Size = UDim2.new(1, 0, 0, 22)
+subtitle.Size = UDim2.new(1, -110, 0, 20)
 subtitle.Font = Enum.Font.Gotham
-subtitle.Text = "Claw Fishing • Native Module"
+subtitle.Text = "Claw Fishing • Advanced Native"
 subtitle.TextSize = 12
 subtitle.TextColor3 = Color3.fromRGB(142, 151, 170)
 subtitle.TextXAlignment = Enum.TextXAlignment.Left
@@ -218,8 +252,8 @@ subtitle.Parent = header
 
 local nativeBadge = Instance.new("TextLabel")
 nativeBadge.AnchorPoint = Vector2.new(1, 0)
-nativeBadge.Position = UDim2.new(1, 0, 0, 2)
-nativeBadge.Size = UDim2.fromOffset(64, 24)
+nativeBadge.Position = UDim2.new(1, -40, 0, 1)
+nativeBadge.Size = UDim2.fromOffset(66, 24)
 nativeBadge.BackgroundColor3 = Color3.fromRGB(24, 48, 36)
 nativeBadge.BorderSizePixel = 0
 nativeBadge.Font = Enum.Font.GothamBold
@@ -232,17 +266,67 @@ local badgeCorner = Instance.new("UICorner")
 badgeCorner.CornerRadius = UDim.new(1, 0)
 badgeCorner.Parent = nativeBadge
 
+local minimize = Instance.new("TextButton")
+minimize.AnchorPoint = Vector2.new(1, 0)
+minimize.Position = UDim2.new(1, 0, 0, 0)
+minimize.Size = UDim2.fromOffset(30, 26)
+minimize.BackgroundColor3 = Color3.fromRGB(29, 34, 46)
+minimize.BorderSizePixel = 0
+minimize.Font = Enum.Font.GothamBold
+minimize.Text = "–"
+minimize.TextSize = 18
+minimize.TextColor3 = Color3.fromRGB(225, 230, 242)
+minimize.Parent = header
+
+local minCorner = Instance.new("UICorner")
+minCorner.CornerRadius = UDim.new(0, 7)
+minCorner.Parent = minimize
+
 local divider = Instance.new("Frame")
-divider.Position = UDim2.fromOffset(20, 78)
+divider.Position = UDim2.fromOffset(20, 80)
 divider.Size = UDim2.new(1, -40, 0, 1)
 divider.BackgroundColor3 = Color3.fromRGB(38, 43, 56)
 divider.BorderSizePixel = 0
 divider.Parent = main
 
+-- Info strip
+local infoStrip = Instance.new("Frame")
+infoStrip.Position = UDim2.fromOffset(20, 94)
+infoStrip.Size = UDim2.new(1, -40, 0, 54)
+infoStrip.BackgroundColor3 = Color3.fromRGB(15, 19, 28)
+infoStrip.BorderSizePixel = 0
+infoStrip.Parent = main
+
+local infoCorner = Instance.new("UICorner")
+infoCorner.CornerRadius = UDim.new(0, 9)
+infoCorner.Parent = infoStrip
+
+local gameLabel = Instance.new("TextLabel")
+gameLabel.BackgroundTransparency = 1
+gameLabel.Position = UDim2.fromOffset(10, 7)
+gameLabel.Size = UDim2.new(1, -20, 0, 18)
+gameLabel.Font = Enum.Font.GothamMedium
+gameLabel.Text = "Claw Fishing"
+gameLabel.TextSize = 12
+gameLabel.TextColor3 = Color3.fromRGB(229, 233, 244)
+gameLabel.TextXAlignment = Enum.TextXAlignment.Left
+gameLabel.Parent = infoStrip
+
+local idLabel = Instance.new("TextLabel")
+idLabel.BackgroundTransparency = 1
+idLabel.Position = UDim2.fromOffset(10, 27)
+idLabel.Size = UDim2.new(1, -20, 0, 17)
+idLabel.Font = Enum.Font.Gotham
+idLabel.Text = "Place " .. tostring(game.PlaceId) .. "  •  Universe " .. tostring(game.GameId)
+idLabel.TextSize = 10
+idLabel.TextColor3 = Color3.fromRGB(126, 135, 153)
+idLabel.TextXAlignment = Enum.TextXAlignment.Left
+idLabel.Parent = infoStrip
+
 local content = Instance.new("Frame")
 content.BackgroundTransparency = 1
-content.Position = UDim2.fromOffset(20, 92)
-content.Size = UDim2.new(1, -40, 1, -154)
+content.Position = UDim2.fromOffset(20, 160)
+content.Size = UDim2.new(1, -40, 0, 216)
 content.Parent = main
 
 local list = Instance.new("UIListLayout")
@@ -254,7 +338,7 @@ local valueLabels = {}
 
 local function createRow(labelText, key)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 29)
+    row.Size = UDim2.new(1, 0, 0, 31)
     row.BackgroundColor3 = Color3.fromRGB(17, 21, 30)
     row.BorderSizePixel = 0
     row.Parent = content
@@ -266,7 +350,7 @@ local function createRow(labelText, key)
     local label = Instance.new("TextLabel")
     label.BackgroundTransparency = 1
     label.Position = UDim2.fromOffset(10, 0)
-    label.Size = UDim2.new(0.42, -10, 1, 0)
+    label.Size = UDim2.new(0.39, -10, 1, 0)
     label.Font = Enum.Font.Gotham
     label.Text = labelText
     label.TextSize = 11
@@ -276,8 +360,8 @@ local function createRow(labelText, key)
 
     local value = Instance.new("TextLabel")
     value.BackgroundTransparency = 1
-    value.Position = UDim2.new(0.42, 0, 0, 0)
-    value.Size = UDim2.new(0.58, -10, 1, 0)
+    value.Position = UDim2.new(0.39, 0, 0, 0)
+    value.Size = UDim2.new(0.61, -10, 1, 0)
     value.Font = Enum.Font.GothamMedium
     value.Text = "—"
     value.TextSize = 11
@@ -292,46 +376,58 @@ end
 createRow("Cash / Money", "cash")
 createRow("Fish Stat", "fishStat")
 createRow("Session", "session")
-createRow("Workspace Scan", "scan")
-createRow("Tsunami Status", "warning")
+createRow("World Objects", "scan")
+createRow("Prompts", "prompts")
+createRow("Event Warning", "warning")
 
-local footer = Instance.new("Frame")
-footer.BackgroundTransparency = 1
-footer.Position = UDim2.new(0, 20, 1, -54)
-footer.Size = UDim2.new(1, -40, 0, 38)
-footer.Parent = main
+-- Controls
+local controls = Instance.new("Frame")
+controls.BackgroundTransparency = 1
+controls.Position = UDim2.fromOffset(20, 392)
+controls.Size = UDim2.new(1, -40, 0, 56)
+controls.Parent = main
 
 local refresh = Instance.new("TextButton")
-refresh.Size = UDim2.new(0.68, -5, 1, 0)
+refresh.Size = UDim2.new(0.48, -4, 0, 34)
 refresh.BackgroundColor3 = Color3.fromRGB(32, 38, 52)
 refresh.BorderSizePixel = 0
 refresh.AutoButtonColor = true
 refresh.Font = Enum.Font.GothamMedium
 refresh.Text = "Refresh Scan"
-refresh.TextSize = 12
+refresh.TextSize = 11
 refresh.TextColor3 = Color3.fromRGB(235, 238, 247)
-refresh.Parent = footer
+refresh.Parent = controls
 
 local refreshCorner = Instance.new("UICorner")
 refreshCorner.CornerRadius = UDim.new(0, 9)
 refreshCorner.Parent = refresh
 
-local close = Instance.new("TextButton")
-close.AnchorPoint = Vector2.new(1, 0)
-close.Position = UDim2.new(1, 0, 0, 0)
-close.Size = UDim2.new(0.32, -5, 1, 0)
-close.BackgroundColor3 = Color3.fromRGB(50, 29, 33)
-close.BorderSizePixel = 0
-close.AutoButtonColor = true
-close.Font = Enum.Font.GothamMedium
-close.Text = "Close"
-close.TextSize = 12
-close.TextColor3 = Color3.fromRGB(255, 190, 194)
-close.Parent = footer
+local auto = Instance.new("TextButton")
+auto.AnchorPoint = Vector2.new(1, 0)
+auto.Position = UDim2.new(1, 0, 0, 0)
+auto.Size = UDim2.new(0.48, -4, 0, 34)
+auto.BackgroundColor3 = Color3.fromRGB(25, 48, 37)
+auto.BorderSizePixel = 0
+auto.AutoButtonColor = true
+auto.Font = Enum.Font.GothamMedium
+auto.Text = "Auto Refresh: ON"
+auto.TextSize = 11
+auto.TextColor3 = Color3.fromRGB(168, 237, 188)
+auto.Parent = controls
 
-local closeCorner = Instance.new("UICorner")
-closeCorner.CornerRadius = UDim.new(0, 9)
-closeCorner.Parent = close
+local autoCorner = Instance.new("UICorner")
+autoCorner.CornerRadius = UDim.new(0, 9)
+autoCorner.Parent = auto
+
+local close = Instance.new("TextButton")
+close.Position = UDim2.new(0, 0, 0, 40)
+close.Size = UDim2.new(1, 0, 0, 16)
+close.BackgroundTransparency = 1
+close.Font = Enum.Font.Gotham
+close.Text = "Close DChronos Module"
+close.TextSize = 10
+close.TextColor3 = Color3.fromRGB(133, 141, 158)
+close.Parent = controls
 
 local function refreshStats(forceScan)
     local cash, cashName = findValueByNames({
@@ -344,17 +440,18 @@ local function refreshStats(forceScan)
 
     valueLabels.cash.Text = cash ~= nil
         and ((cashName or "Cash") .. ": " .. formatNumber(cash))
-        or "Not exposed in leaderstats"
+        or "Not exposed"
 
     valueLabels.fishStat.Text = fish ~= nil
         and ((fishName or "Fish") .. ": " .. formatNumber(fish))
-        or "Not exposed in leaderstats"
+        or "Not exposed"
 
     local elapsed = math.max(0, os.clock() - state.startedAt)
     valueLabels.session.Text = string.format(
-        "%02d:%02d",
-        math.floor(elapsed / 60),
-        math.floor(elapsed % 60)
+        "%02d:%02d:%02d",
+        math.floor(elapsed / 3600),
+        math.floor(elapsed / 60) % 60,
+        math.floor(elapsed) % 60
     )
 
     if forceScan then
@@ -369,58 +466,87 @@ local function refreshStats(forceScan)
         state.scan.aquarium
     )
 
+    valueLabels.prompts.Text = tostring(state.scan.prompts)
+
     state.warning = detectWarningText()
     valueLabels.warning.Text = state.warning
 
-    local lowerWarning = string.lower(state.warning)
-    if lowerWarning ~= "no tsunami warning detected" then
+    if state.warning ~= "No tsunami warning detected" then
         valueLabels.warning.TextColor3 = Color3.fromRGB(255, 202, 122)
     else
         valueLabels.warning.TextColor3 = Color3.fromRGB(225, 229, 239)
     end
 end
 
+local function setMenuVisible(visible)
+    state.visible = visible
+    main.Visible = visible
+    floatButton.Visible = not visible
+end
+
+minimize.MouseButton1Click:Connect(function()
+    setMenuVisible(false)
+end)
+
+floatButton.MouseButton1Click:Connect(function()
+    setMenuVisible(true)
+end)
+
 refresh.MouseButton1Click:Connect(function()
     refresh.Text = "Scanning..."
     task.spawn(function()
         refreshStats(true)
+        task.wait(0.15)
         refresh.Text = "Refresh Scan"
     end)
+end)
+
+auto.MouseButton1Click:Connect(function()
+    state.autoRefresh = not state.autoRefresh
+
+    if state.autoRefresh then
+        auto.Text = "Auto Refresh: ON"
+        auto.BackgroundColor3 = Color3.fromRGB(25, 48, 37)
+        auto.TextColor3 = Color3.fromRGB(168, 237, 188)
+    else
+        auto.Text = "Auto Refresh: OFF"
+        auto.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
+        auto.TextColor3 = Color3.fromRGB(233, 198, 159)
+    end
 end)
 
 close.MouseButton1Click:Connect(function()
     gui:Destroy()
 end)
 
--- Simple dragging, desktop-friendly.
-do
+local function makeDraggable(target, handle)
     local dragging = false
     local dragStart
     local startPos
 
-    main.InputBegan:Connect(function(input)
+    handle.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
-            startPos = main.Position
+            startPos = target.Position
         end
     end)
 
-    main.InputEnded:Connect(function(input)
+    handle.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
     end)
 
-    game:GetService("UserInputService").InputChanged:Connect(function(input)
+    UserInputService.InputChanged:Connect(function(input)
         if dragging and (
             input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch
         ) then
             local delta = input.Position - dragStart
-            main.Position = UDim2.new(
+            target.Position = UDim2.new(
                 startPos.X.Scale,
                 startPos.X.Offset + delta.X,
                 startPos.Y.Scale,
@@ -430,22 +556,34 @@ do
     end)
 end
 
+makeDraggable(main, header)
+makeDraggable(floatButton, floatButton)
+
 gui.Parent = playerGui
 
--- Initial scan.
 task.spawn(function()
     state.scan = scanWorkspace()
     refreshStats(false)
 end)
 
--- Lightweight live refresh. Workspace scan stays manual because it can be large.
 task.spawn(function()
+    local scanTicker = 0
+
     while gui.Parent do
         task.wait(1)
-        pcall(function()
-            refreshStats(false)
-        end)
+
+        if state.autoRefresh then
+            scanTicker += 1
+
+            pcall(function()
+                refreshStats(scanTicker % 5 == 0)
+            end)
+        else
+            pcall(function()
+                refreshStats(false)
+            end)
+        end
     end
 end)
 
-print("[DChronos Native] Claw Fishing module loaded.")
+print("[DChronos Native] Claw Fishing Advanced v1.2.2 loaded.")
