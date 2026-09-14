@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Core Flow Fix v1.2.9
+    Edition: Mobile Fishing Engine v1.3.0
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.2.9"
+local MODULE_VERSION = "1.3.0"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -39,6 +39,7 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ContextActionService = game:GetService("ContextActionService")
 
 local VirtualInputManager = nil
 pcall(function()
@@ -108,7 +109,12 @@ local state = {
         busy = false,
         lastCycleAt = 0,
         cycleDelay = 3.0,
-        pauseOnWarning = true,
+        -- Do not block Auto Fishing just because Storm/Weather UI is visible.
+        -- The passive radar already survives WeatherState changes.
+        pauseOnWarning = false,
+        inputStrategyIndex = 1,
+        lastInputStrategy = "None",
+        failedInputCycles = 0,
         networkFish = {},
         networkReady = false,
         lastCaughtFishId = nil,
@@ -1061,45 +1067,21 @@ local function getPlayerBoat()
 end
 
 local function getPlayerClaw(origin)
-    local best = nil
-    local bestScore = -math.huge
-    local playerName = lower(player.Name)
-    local userId = tostring(player.UserId)
+    local boat = getPlayerBoat()
 
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") or obj:IsA("BasePart") then
-            local n = lower(obj.Name)
-            local path = lower(fullNameSafe(obj))
+    if boat then
+        local exactClaw = boat:FindFirstChild("Claw", true)
+        if exactClaw then
+            return exactClaw
+        end
 
-            if n:find("claw", 1, true)
-                or n:find("hook", 1, true)
-                or n:find("crane", 1, true) then
-
-                local cf = getObjectCFrame(obj)
-                if cf then
-                    local score = 0
-
-                    if path:find(playerName, 1, true) then
-                        score += 80
-                    end
-
-                    if path:find(userId, 1, true) then
-                        score += 80
-                    end
-
-                    local distance = (cf.Position - origin).Magnitude
-                    score += math.max(0, 50 - distance / 5)
-
-                    if score > bestScore then
-                        bestScore = score
-                        best = obj
-                    end
-                end
-            end
+        local exactCrane = boat:FindFirstChild("Crane", true)
+        if exactCrane then
+            return exactCrane
         end
     end
 
-    return best
+    return nil
 end
 
 local function fishMatchesFilter(rank)
@@ -1633,6 +1615,198 @@ local function playMobileGesture()
 end
 
 
+
+local function discoverClawContextAction()
+    local bestName = nil
+    local bestScore = -math.huge
+    local bestInfo = nil
+
+    local ok, actions = pcall(function()
+        return ContextActionService:GetAllBoundActionInfo()
+    end)
+
+    if not ok or type(actions) ~= "table" then
+        return nil, nil, -math.huge
+    end
+
+    for actionName, info in pairs(actions) do
+        local combined = lower(actionName)
+
+        if type(info) == "table" then
+            combined = combined
+                .. " "
+                .. lower(info.title)
+                .. " "
+                .. lower(info.description)
+        end
+
+        local score = 0
+
+        if combined:find("claw", 1, true) then score += 160 end
+        if combined:find("crane", 1, true) then score += 130 end
+        if combined:find("catch", 1, true) then score += 110 end
+        if combined:find("grab", 1, true) then score += 100 end
+        if combined:find("drop", 1, true) then score += 70 end
+        if combined:find("pull", 1, true) then score += 60 end
+        if combined:find("fish", 1, true) then score += 35 end
+
+        if type(info) == "table" and info.createTouchButton then
+            score += 20
+        end
+
+        if score > bestScore then
+            bestName = actionName
+            bestScore = score
+            bestInfo = info
+        end
+    end
+
+    if bestScore <= 0 then
+        return nil, nil, bestScore
+    end
+
+    return bestName, bestInfo, bestScore
+end
+
+local function activateContextAction()
+    local actionName, info, score = discoverClawContextAction()
+
+    if not actionName then
+        return false, "No claw-like ContextAction binding found"
+    end
+
+    local button = nil
+    pcall(function()
+        button = ContextActionService:GetButton(actionName)
+    end)
+
+    if button and button:IsA("GuiButton") then
+        local ok, method = activateCalibratedButton(button)
+        if ok then
+            return true,
+                "ContextButton "
+                    .. tostring(actionName)
+                    .. " via "
+                    .. tostring(method)
+        end
+    end
+
+    -- Some mobile games bind the action without exposing a touch button.
+    local called = false
+    local callErr = nil
+
+    local ok, err = pcall(function()
+        ContextActionService:CallFunction(
+            actionName,
+            Enum.UserInputState.Begin,
+            nil
+        )
+        task.wait(0.12)
+        ContextActionService:CallFunction(
+            actionName,
+            Enum.UserInputState.End,
+            nil
+        )
+        called = true
+    end)
+
+    if not ok then
+        callErr = err
+    end
+
+    if called then
+        return true, "ContextAction " .. tostring(actionName)
+    end
+
+    return false,
+        "ContextAction "
+            .. tostring(actionName)
+            .. " failed: "
+            .. tostring(callErr)
+end
+
+local function calibratedButtonSequence()
+    if not state.mobileMacro.calibrated then
+        return false, "No calibrated gesture"
+    end
+
+    local used = 0
+    local lastT = 0
+
+    for _, event in ipairs(state.mobileMacro.events) do
+        if event.state == Enum.UserInputState.Begin.Value
+            and event.buttonRef
+            and event.buttonRef.Parent then
+
+            local delay = math.max(0, (event.t or 0) - lastT)
+            if delay > 0 then
+                task.wait(delay)
+            end
+
+            local ok = activateCalibratedButton(event.buttonRef)
+            if ok then
+                used += 1
+            end
+
+            lastT = event.t or lastT
+        end
+    end
+
+    if used > 0 then
+        return true, "Calibrated GuiButtons x" .. tostring(used)
+    end
+
+    return false, "Calibration did not contain a game GuiButton"
+end
+
+local function calibratedMouseSequence()
+    if not state.mobileMacro.calibrated then
+        return false, "No calibrated gesture"
+    end
+
+    if not VirtualInputManager then
+        return false, "VirtualInputManager unavailable"
+    end
+
+    local used = 0
+    local lastT = 0
+
+    for _, event in ipairs(state.mobileMacro.events) do
+        if event.state == Enum.UserInputState.Begin.Value then
+            local delay = math.max(0, (event.t or 0) - lastT)
+            if delay > 0 then
+                task.wait(delay)
+            end
+
+            local x = tonumber(event.x) or 0
+            local y = tonumber(event.y) or 0
+
+            local ok = pcall(function()
+                VirtualInputManager:SendMouseButtonEvent(
+                    x, y, 0, true, game, 0
+                )
+                task.wait(0.07)
+                VirtualInputManager:SendMouseButtonEvent(
+                    x, y, 0, false, game, 0
+                )
+            end)
+
+            if ok then
+                used += 1
+            end
+
+            lastT = event.t or lastT
+        end
+    end
+
+    if used > 0 then
+        return true, "Calibrated coordinates via LMB x" .. tostring(used)
+    end
+
+    return false, "No calibrated tap coordinates"
+end
+
+
 local function findClawControlButton()
     local best, bestScore = nil, -math.huge
 
@@ -1710,52 +1884,68 @@ local function activateGuiButton(button)
     return false, "Button activation failed and VirtualInputManager unavailable"
 end
 
-local function sendClawInput()
-    if IS_TOUCH_DEVICE then
-        if state.mobileMacro.calibrated then
-            return playMobileGesture()
+local INPUT_STRATEGIES = {
+    "ContextAction",
+    "CalibratedButton",
+    "CalibratedMouse",
+    "CalibratedTouch",
+}
+
+local function sendClawInput(strategyIndex)
+    strategyIndex = tonumber(strategyIndex) or state.fishing.inputStrategyIndex or 1
+
+    if not IS_TOUCH_DEVICE then
+        local button = findClawControlButton()
+
+        if button then
+            local ok, err = activateGuiButton(button)
+            if not ok then return false, err, "DesktopGuiButton" end
+
+            task.wait(0.85)
+            activateGuiButton(button)
+            task.wait(0.45)
+            activateGuiButton(button)
+
+            return true,
+                "gui-button:" .. fullNameSafe(button),
+                "DesktopGuiButton"
         end
 
-        return false, "Mobile gesture not calibrated"
+        return false, "No desktop claw control found", "DesktopGuiButton"
     end
 
-    local button = findClawControlButton()
+    local strategy = INPUT_STRATEGIES[
+        math.clamp(strategyIndex, 1, #INPUT_STRATEGIES)
+    ]
 
-    if button then
-        local ok, err = activateGuiButton(button)
-        if not ok then return false, err end
+    local ok, message = false, "Unknown strategy"
 
-        task.wait(0.85)
-        activateGuiButton(button)
-        task.wait(0.45)
-        activateGuiButton(button)
+    if strategy == "ContextAction" then
+        ok, message = activateContextAction()
 
-        return true, "gui-button:" .. fullNameSafe(button)
+    elseif strategy == "CalibratedButton" then
+        ok, message = calibratedButtonSequence()
+
+    elseif strategy == "CalibratedMouse" then
+        ok, message = calibratedMouseSequence()
+
+    elseif strategy == "CalibratedTouch" then
+        ok, message = playMobileGesture()
     end
 
-    if not VirtualInputManager then
-        return false, "No Claw GuiButton and VirtualInputManager unavailable"
+    state.fishing.lastInputStrategy = strategy
+
+    return ok, message, strategy
+end
+
+local function rotateInputStrategy()
+    state.fishing.inputStrategyIndex += 1
+
+    if state.fishing.inputStrategyIndex > #INPUT_STRATEGIES then
+        state.fishing.inputStrategyIndex = 1
     end
 
-    local camera = Workspace.CurrentCamera
-    local viewport = camera and camera.ViewportSize or Vector2.new(800, 600)
-    local x = math.floor(viewport.X / 2)
-    local y = math.floor(viewport.Y / 2)
-
-    local ok, err = pcall(function()
-        for _ = 1, 3 do
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 0)
-            task.wait(0.08)
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
-            task.wait(0.6)
-        end
-    end)
-
-    if not ok then
-        return false, tostring(err)
-    end
-
-    return true, "center-lmb"
+    return INPUT_STRATEGIES[state.fishing.inputStrategyIndex]
 end
 
 local function targetIsAligned(target)
@@ -1764,18 +1954,16 @@ local function targetIsAligned(target)
     end
 
     local origin, boat = getFishingOrigin()
-    local claw = getPlayerClaw(origin)
     local sourcePosition = origin
 
-    if claw then
-        local cf = getObjectCFrame(claw)
-        if cf then
-            sourcePosition = cf.Position
-        end
-    elseif boat then
-        local cf = getObjectCFrame(boat)
-        if cf then
-            sourcePosition = cf.Position
+    if not state.fishing.autoApproach then
+        local claw = getPlayerClaw(origin)
+
+        if claw then
+            local cf = getObjectCFrame(claw)
+            if cf then
+                sourcePosition = cf.Position
+            end
         end
     end
 
@@ -1786,22 +1974,12 @@ local function targetIsAligned(target)
         fishPos.Z - sourcePosition.Z
     ).Magnitude
 
-    -- Network positions are more accurate than scanning workspace fish models.
-    return horizontal <= 30, horizontal
+    -- Auto Approach intentionally parks ~12 studs from the fish.
+    return horizontal <= 34, horizontal
 end
 
 local function runAutoFishingCycle()
     if state.fishing.busy or not state.fishing.autoFishing then
-        return
-    end
-
-    if state.fishing.pauseOnWarning and state.warningActive then
-        setStatus("Auto Fishing paused: event warning detected", "warn")
-        return
-    end
-
-    if IS_TOUCH_DEVICE and not state.mobileMacro.calibrated then
-        setStatus("Auto Fishing needs Mobile Gesture Calibration first", "warn")
         return
     end
 
@@ -1862,32 +2040,69 @@ local function runAutoFishingCycle()
         "good"
     )
 
-    local ok, message = sendClawInput()
+    local strategyIndex = state.fishing.inputStrategyIndex
+    local ok, message, strategy = sendClawInput(strategyIndex)
 
     if not ok then
-        setStatus("Auto Fishing input failed: " .. tostring(message), "bad")
+        local nextStrategy = rotateInputStrategy()
+        state.fishing.failedInputCycles += 1
+
+        setStatus(
+            "Input "
+                .. tostring(strategy)
+                .. " failed • next: "
+                .. tostring(nextStrategy)
+                .. " • "
+                .. tostring(message),
+            "warn"
+        )
+
         state.fishing.busy = false
         return
     end
 
     setStatus(
-        "Claw input sent • " .. tostring(message),
+        "Claw input sent • "
+            .. tostring(strategy)
+            .. " • "
+            .. tostring(message),
         "good"
     )
 
     -- Passive confirmation: FishUpdate "freeze" names the catcher and caught fish id.
     local waitStart = os.clock()
+    local confirmed = false
 
-    while os.clock() - waitStart < 4 do
+    while os.clock() - waitStart < 6 do
         if state.fishing.lastCaughtAt > caughtBefore then
+            confirmed = true
+            state.fishing.failedInputCycles = 0
+
             setStatus(
                 "Catch confirmed • Fish ID "
-                    .. tostring(state.fishing.lastCaughtFishId or "?"),
+                    .. tostring(state.fishing.lastCaughtFishId or "?")
+                    .. " • "
+                    .. tostring(strategy),
                 "good"
             )
+
             break
         end
+
         task.wait(0.15)
+    end
+
+    if not confirmed then
+        local nextStrategy = rotateInputStrategy()
+        state.fishing.failedInputCycles += 1
+
+        setStatus(
+            "No catch confirmation with "
+                .. tostring(strategy)
+                .. " • next cycle: "
+                .. tostring(nextStrategy),
+            "warn"
+        )
     end
 
     state.fishing.busy = false
@@ -2853,7 +3068,7 @@ local autoApproachButton = createActionButton(fishingPage, 0.51, 205, 0.49, "Aut
 local scanFishButton = createActionButton(fishingPage, 0, 250, 1, "Scan / Select Fish Target")
 local calibrateGestureButton = createActionButton(fishingPage, 0, 295, 1, "Calibrate iPad Claw Gesture (13s)")
 local testApproachButton = createActionButton(fishingPage, 0, 340, 0.49, "Test Approach Now")
-local testClawButton = createActionButton(fishingPage, 0.51, 340, 0.49, "Test Claw Input")
+local testClawButton = createActionButton(fishingPage, 0.51, 340, 0.49, "Test Claw • ContextAction")
 
 autoFishingButton.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
 autoFishingButton.TextColor3 = Color3.fromRGB(233, 198, 159)
@@ -2866,7 +3081,7 @@ local debugInfo = Instance.new("TextLabel")
 debugInfo.BackgroundTransparency = 1
 debugInfo.Size = UDim2.new(1, 0, 0, 105)
 debugInfo.Font = Enum.Font.Gotham
-debugInfo.Text = "iPad Safe Calibration: recorder is passive and does not hook outgoing remotes.\n\nSit in your boat, keep fish visible, then record ONE manual catch and copy the report."
+debugInfo.Text = "Mobile Fishing Engine: network fish + independent Auto Approach are active.\n\nAuto Fishing rotates ContextAction → calibrated button → coordinate click → touch replay until FishUpdate confirms a catch."
 debugInfo.TextWrapped = true
 debugInfo.TextSize = 11
 debugInfo.TextColor3 = Color3.fromRGB(158, 166, 184)
@@ -3316,19 +3531,37 @@ testApproachButton.MouseButton1Click:Connect(function()
 end)
 
 testClawButton.MouseButton1Click:Connect(function()
-    testClawButton.Text = "Testing..."
+    testClawButton.Text = "Testing strategy..."
 
     task.spawn(function()
-        local ok, message = sendClawInput()
+        local index = state.fishing.inputStrategyIndex
+        local ok, message, strategy = sendClawInput(index)
 
         if ok then
-            setStatus("Test Claw OK • " .. tostring(message), "good")
+            setStatus(
+                "Test Claw sent • "
+                    .. tostring(strategy)
+                    .. " • "
+                    .. tostring(message),
+                "good"
+            )
         else
-            setStatus("Test Claw failed: " .. tostring(message), "bad")
+            local nextStrategy = rotateInputStrategy()
+            setStatus(
+                "Test "
+                    .. tostring(strategy)
+                    .. " failed • next: "
+                    .. tostring(nextStrategy)
+                    .. " • "
+                    .. tostring(message),
+                "warn"
+            )
         end
 
-        task.wait(0.9)
-        testClawButton.Text = "Test Claw Input"
+        task.wait(1.0)
+        testClawButton.Text =
+            "Test Claw • "
+            .. tostring(INPUT_STRATEGIES[state.fishing.inputStrategyIndex])
     end)
 end)
 
@@ -3418,7 +3651,12 @@ autoFishingButton.MouseButton1Click:Connect(function()
         autoFishingButton.Text = "Auto Fishing: ON"
         autoFishingButton.BackgroundColor3 = Color3.fromRGB(25, 48, 37)
         autoFishingButton.TextColor3 = Color3.fromRGB(168, 237, 188)
-        setStatus("Auto Fishing enabled (experimental)", "good")
+        setStatus(
+            "Auto Fishing ON • strategy: "
+                .. tostring(INPUT_STRATEGIES[state.fishing.inputStrategyIndex])
+                .. " • weather pause OFF",
+            "good"
+        )
     else
         autoFishingButton.Text = "Auto Fishing: OFF"
         autoFishingButton.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
@@ -3634,4 +3872,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Core Flow Fix v1.2.9 loaded.")
+print("[DChronos Native] Claw Fishing Mobile Fishing Engine v1.3.0 loaded.")
