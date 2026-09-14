@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Mobile Safe Calibration v1.2.7
+    Edition: Network Radar v1.2.8
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.2.7"
+local MODULE_VERSION = "1.2.8"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -89,7 +89,7 @@ local state = {
     fishing = {
         autoFishing = false,
         autoApproach = false,
-        filterIndex = 2, -- Rare+
+        filterIndex = 1, -- Any until live species metadata is resolved
         currentTarget = nil,
         currentRarity = "Unknown",
         currentRank = 0,
@@ -99,6 +99,20 @@ local state = {
         lastCycleAt = 0,
         cycleDelay = 3.0,
         pauseOnWarning = true,
+        networkFish = {},
+        networkReady = false,
+        lastCaughtFishId = nil,
+        lastCaughtAt = 0,
+        speciesCatalog = {},
+        speciesCatalogCount = 0,
+    },
+    mobileMacro = {
+        recording = false,
+        calibrated = false,
+        events = {},
+        startedAt = 0,
+        duration = 0,
+        lastMessage = "Not calibrated",
     },
 }
 
@@ -628,6 +642,291 @@ local function readRarityFromObject(instance)
     return 0, "Unknown"
 end
 
+
+local function readInstanceSpeciesMetadata(instance)
+    if not instance then
+        return nil, nil, nil
+    end
+
+    local speciesId = nil
+    local rarityValue = nil
+    local displayName = nil
+
+    for _, attrName in ipairs({
+        "SpeciesId", "speciesId", "SpeciesID", "speciesID",
+        "FishId", "fishId", "Id", "ID"
+    }) do
+        local ok, value = pcall(function()
+            return instance:GetAttribute(attrName)
+        end)
+
+        if ok and tonumber(value) then
+            speciesId = tonumber(value)
+            break
+        end
+    end
+
+    for _, attrName in ipairs({"Rarity", "rarity", "Tier", "tier", "Grade", "grade"}) do
+        local ok, value = pcall(function()
+            return instance:GetAttribute(attrName)
+        end)
+
+        if ok and value ~= nil then
+            rarityValue = value
+            break
+        end
+    end
+
+    for _, attrName in ipairs({"DisplayName", "displayName", "FishName", "fishName", "Name"}) do
+        local ok, value = pcall(function()
+            return instance:GetAttribute(attrName)
+        end)
+
+        if ok and type(value) == "string" and value ~= "" then
+            displayName = value
+            break
+        end
+    end
+
+    for _, child in ipairs(instance:GetChildren()) do
+        local n = lower(child.Name)
+
+        if not speciesId
+            and (n == "speciesid" or n == "fishid" or n == "id")
+            and (child:IsA("IntValue") or child:IsA("NumberValue")) then
+            speciesId = tonumber(child.Value)
+        end
+
+        if not rarityValue
+            and (n == "rarity" or n == "tier" or n == "grade")
+            and (child:IsA("StringValue") or child:IsA("IntValue") or child:IsA("NumberValue")) then
+            rarityValue = child.Value
+        end
+
+        if not displayName
+            and (n == "displayname" or n == "fishname")
+            and child:IsA("StringValue") then
+            displayName = child.Value
+        end
+    end
+
+    return speciesId, rarityValue, displayName
+end
+
+local function rebuildSpeciesCatalog()
+    local catalog = {}
+    local count = 0
+
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("Folder")
+            or obj:IsA("Model")
+            or obj:IsA("Configuration")
+            or obj:IsA("ValueBase") then
+
+            local speciesId, rarityValue, displayName = readInstanceSpeciesMetadata(obj)
+
+            if speciesId and rarityValue ~= nil then
+                local rank, rarityName = rarityFromText(rarityValue)
+
+                if not rank and tonumber(rarityValue) then
+                    rank = math.clamp(math.floor(tonumber(rarityValue)), 1, 7)
+                    rarityName = RARITY_NAMES[rank]
+                end
+
+                if rank then
+                    if not catalog[speciesId] then
+                        count += 1
+                    end
+
+                    catalog[speciesId] = {
+                        rank = rank,
+                        rarity = rarityName or tostring(rarityValue),
+                        name = displayName or obj.Name,
+                        source = fullNameSafe(obj),
+                    }
+                end
+            end
+        end
+    end
+
+    state.fishing.speciesCatalog = catalog
+    state.fishing.speciesCatalogCount = count
+    return count
+end
+
+local function getSpeciesInfo(speciesId)
+    speciesId = tonumber(speciesId)
+    if not speciesId then
+        return {
+            rank = 0,
+            rarity = "Unknown",
+            name = "Unknown species",
+        }
+    end
+
+    local info = state.fishing.speciesCatalog[speciesId]
+    if info then
+        return info
+    end
+
+    return {
+        rank = 0,
+        rarity = "Unknown",
+        name = "Species #" .. tostring(speciesId),
+    }
+end
+
+local function getNetworkFishPosition(fish)
+    if not fish then
+        return nil
+    end
+
+    return fish.position or fish.destination or fish.spawnPosition
+end
+
+local function networkFishLabel(fish)
+    if not fish then
+        return "Fish"
+    end
+
+    local info = getSpeciesInfo(fish.speciesId)
+    local mutation = fish.mutation and (" • " .. tostring(fish.mutation)) or ""
+
+    return string.format(
+        "%s [%s]%s",
+        info.name or ("Species #" .. tostring(fish.speciesId)),
+        info.rarity or "Unknown",
+        mutation
+    )
+end
+
+local function upsertNetworkFishSpawn(entry)
+    if type(entry) ~= "table" then
+        return
+    end
+
+    local id = tonumber(entry[1])
+    if not id then
+        return
+    end
+
+    local meta = type(entry[11]) == "table" and entry[11] or {}
+    local fish = state.fishing.networkFish[id] or { id = id }
+
+    fish.id = id
+    fish.speciesId = tonumber(entry[2]) or fish.speciesId
+
+    if tonumber(entry[3]) and tonumber(entry[4]) and tonumber(entry[5]) then
+        fish.spawnPosition = Vector3.new(
+            tonumber(entry[3]),
+            tonumber(entry[4]),
+            tonumber(entry[5])
+        )
+        fish.position = fish.position or fish.spawnPosition
+    end
+
+    if tonumber(entry[6]) and tonumber(entry[7]) and tonumber(entry[8]) then
+        fish.destination = Vector3.new(
+            tonumber(entry[6]),
+            tonumber(entry[7]),
+            tonumber(entry[8])
+        )
+    end
+
+    fish.spawnedAt = tonumber(entry[9]) or fish.spawnedAt
+    fish.expireAt = tonumber(entry[10]) or fish.expireAt
+    fish.size = tonumber(meta.size) or fish.size
+    fish.mutation = meta.mutation or fish.mutation
+    fish.lastUpdateAt = os.clock()
+
+    state.fishing.networkFish[id] = fish
+    state.fishing.networkReady = true
+end
+
+local function upsertNetworkFishUpdate(entry)
+    if type(entry) ~= "table" then
+        return
+    end
+
+    local id = tonumber(entry[1])
+    if not id then
+        return
+    end
+
+    local fish = state.fishing.networkFish[id] or { id = id }
+
+    if tonumber(entry[2]) and tonumber(entry[3]) and tonumber(entry[4]) then
+        fish.position = Vector3.new(
+            tonumber(entry[2]),
+            tonumber(entry[3]),
+            tonumber(entry[4])
+        )
+    end
+
+    fish.serverTime = tonumber(entry[5]) or fish.serverTime
+    fish.expireAt = tonumber(entry[6]) or fish.expireAt
+    fish.lastUpdateAt = os.clock()
+
+    state.fishing.networkFish[id] = fish
+    state.fishing.networkReady = true
+end
+
+local function removeNetworkFishIds(payload)
+    if type(payload) ~= "table" then
+        return
+    end
+
+    for _, idValue in pairs(payload) do
+        local id = tonumber(idValue)
+        if id then
+            state.fishing.networkFish[id] = nil
+
+            if state.fishing.currentTarget
+                and state.fishing.currentTarget.id == id then
+                state.fishing.currentTarget = nil
+            end
+        end
+    end
+end
+
+local function handleNetworkFishUpdate(action, payload)
+    if action == "spawn" and type(payload) == "table" then
+        for _, entry in pairs(payload) do
+            upsertNetworkFishSpawn(entry)
+        end
+    elseif action == "update" and type(payload) == "table" then
+        for _, entry in pairs(payload) do
+            upsertNetworkFishUpdate(entry)
+        end
+    elseif action == "despawn" then
+        removeNetworkFishIds(payload)
+    elseif action == "freeze" and type(payload) == "table" then
+        local id = tonumber(payload.id)
+        if id then
+            local fish = state.fishing.networkFish[id] or { id = id }
+
+            if tonumber(payload.x) and tonumber(payload.y) and tonumber(payload.z) then
+                fish.position = Vector3.new(
+                    tonumber(payload.x),
+                    tonumber(payload.y),
+                    tonumber(payload.z)
+                )
+            end
+
+            fish.frozen = true
+            fish.catcher = tostring(payload.catcher or "")
+            fish.lastUpdateAt = os.clock()
+            state.fishing.networkFish[id] = fish
+
+            if fish.catcher == player.Name then
+                state.fishing.lastCaughtFishId = id
+                state.fishing.lastCaughtAt = os.clock()
+            end
+        end
+    end
+end
+
+
 local function hasRelevantFishAttribute(instance)
     if not instance then return false end
 
@@ -829,64 +1128,68 @@ local function scanFishTarget()
     local best = nil
     local bestScore = -math.huge
     local candidates = 0
+    local filter = RARITY_FILTERS[state.fishing.filterIndex]
 
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") and looksLikeFish(obj) then
-            local cf = getObjectCFrame(obj)
+    for id, fish in pairs(state.fishing.networkFish) do
+        local position = getNetworkFishPosition(fish)
 
-            if cf then
-                local rank, rarity = readRarityFromObject(obj)
+        if position and not fish.frozen then
+            local info = getSpeciesInfo(fish.speciesId)
+            local rank = tonumber(info.rank) or 0
 
-                if fishMatchesFilter(rank or 0) then
-                    candidates += 1
+            local matches = false
 
-                    local distance = (cf.Position - origin).Magnitude
-                    -- Rarity is prioritized first, then proximity.
-                    local score = ((rank or 0) * 100000) - distance
+            if filter.minRank == 0 then
+                matches = true
+            elseif rank > 0 then
+                if filter.name == "Special" then
+                    matches = rank >= 7
+                else
+                    matches = rank >= filter.minRank
+                end
+            end
 
-                    if score > bestScore then
-                        bestScore = score
-                        best = {
-                            instance = obj,
-                            cframe = cf,
-                            rank = rank or 0,
-                            rarity = rarity or "Unknown",
-                            distance = distance,
-                        }
-                    end
+            if matches then
+                candidates += 1
+
+                local distance = (position - origin).Magnitude
+                local rankScore = rank > 0 and rank or 0
+
+                -- Prefer known higher rarity, then mutation, then closer distance.
+                local mutationBonus = 0
+                local mutation = lower(fish.mutation)
+
+                if mutation == "rainbow" then
+                    mutationBonus = 30000
+                elseif mutation == "gold" then
+                    mutationBonus = 20000
+                elseif mutation == "silver" then
+                    mutationBonus = 10000
+                end
+
+                local score = (rankScore * 100000) + mutationBonus - distance
+
+                if score > bestScore then
+                    bestScore = score
+                    best = {
+                        id = id,
+                        speciesId = fish.speciesId,
+                        fish = fish,
+                        position = position,
+                        cframe = CFrame.new(position),
+                        rank = rank,
+                        rarity = info.rarity or "Unknown",
+                        speciesName = info.name or ("Species #" .. tostring(fish.speciesId)),
+                        mutation = fish.mutation,
+                        distance = distance,
+                        label = networkFishLabel(fish),
+                    }
                 end
             end
         end
     end
 
-    -- Fallback to loose parts if no model target was found.
-    if not best then
-        for _, obj in ipairs(Workspace:GetDescendants()) do
-            if obj:IsA("BasePart") and looksLikeFish(obj) then
-                local rank, rarity = readRarityFromObject(obj)
-
-                if fishMatchesFilter(rank or 0) then
-                    local cf = obj.CFrame
-                    candidates += 1
-                    local distance = (cf.Position - origin).Magnitude
-                    local score = ((rank or 0) * 100000) - distance
-
-                    if score > bestScore then
-                        bestScore = score
-                        best = {
-                            instance = obj,
-                            cframe = cf,
-                            rank = rank or 0,
-                            rarity = rarity or "Unknown",
-                            distance = distance,
-                        }
-                    end
-                end
-            end
-        end
-    end
-
-    state.fishing.currentTarget = best and best.instance or nil
+    state.fishing.currentTarget = best
     state.fishing.currentRarity = best and best.rarity or "None"
     state.fishing.currentRank = best and best.rank or 0
     state.fishing.currentDistance = best and best.distance or math.huge
@@ -901,28 +1204,70 @@ local function updateFishHighlight(target)
         fishHighlight = nil
     end
 
-    if not target or not target.instance or not target.instance.Parent then
+    if not target or not target.position then
         return
     end
 
+    local marker = Instance.new("Part")
+    marker.Name = "DChronosNetworkFishTarget"
+    marker.Shape = Enum.PartType.Ball
+    marker.Size = Vector3.new(4, 4, 4)
+    marker.Anchored = true
+    marker.CanCollide = false
+    marker.CanTouch = false
+    marker.CanQuery = false
+    marker.Material = Enum.Material.Neon
+    marker.Transparency = 0.25
+    marker.CFrame = CFrame.new(target.position)
+    marker.Parent = Workspace
+
     local highlight = Instance.new("Highlight")
-    highlight.Name = "DChronosFishTarget"
-    highlight.Adornee = target.instance
-    highlight.FillTransparency = 0.78
-    highlight.OutlineTransparency = 0.05
+    highlight.Name = "TargetHighlight"
+    highlight.Adornee = marker
+    highlight.FillTransparency = 0.45
+    highlight.OutlineTransparency = 0
     highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    highlight.Parent = Workspace
-    fishHighlight = highlight
+    highlight.Parent = marker
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "TargetLabel"
+    billboard.AlwaysOnTop = true
+    billboard.Size = UDim2.fromOffset(260, 58)
+    billboard.StudsOffset = Vector3.new(0, 4.5, 0)
+    billboard.Parent = marker
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundColor3 = Color3.fromRGB(12, 16, 24)
+    label.BackgroundTransparency = 0.12
+    label.BorderSizePixel = 0
+    label.Size = UDim2.fromScale(1, 1)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextWrapped = true
+    label.TextColor3 = Color3.fromRGB(244, 247, 255)
+    label.Text = string.format(
+        "%s\nID %s • %.0f studs",
+        target.label or "Fish",
+        tostring(target.id or "?"),
+        tonumber(target.distance) or 0
+    )
+    label.Parent = billboard
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = label
+
+    fishHighlight = marker
 end
 
 local function approachFishWithBoat(target)
-    if not target or not target.cframe then
-        return false, "Fish target unavailable"
+    if not target or not target.position then
+        return false, "Network fish target unavailable"
     end
 
     local boat = getPlayerBoat()
     if not boat then
-        return false, "Sit in your boat first"
+        return false, "Player boat was not found"
     end
 
     local current = getObjectCFrame(boat)
@@ -930,14 +1275,31 @@ local function approachFishWithBoat(target)
         return false, "Boat pivot unavailable"
     end
 
-    local fishPos = target.cframe.Position
+    local fishPos = target.position
     local currentPos = current.Position
-    local rotation = current - current.Position
-    local destination = CFrame.new(
+    local flatDirection = Vector3.new(
+        fishPos.X - currentPos.X,
+        0,
+        fishPos.Z - currentPos.Z
+    )
+
+    if flatDirection.Magnitude < 0.1 then
+        flatDirection = Vector3.new(0, 0, -1)
+    else
+        flatDirection = flatDirection.Unit
+    end
+
+    -- Stop a short distance from the fish so the claw has room to drop.
+    local approachPosition = Vector3.new(
         fishPos.X,
         currentPos.Y,
-        fishPos.Z + 7
-    ) * rotation
+        fishPos.Z
+    ) - (flatDirection * 12)
+
+    local destination = CFrame.lookAt(
+        approachPosition,
+        Vector3.new(fishPos.X, currentPos.Y, fishPos.Z)
+    )
 
     local ok, err = pcall(function()
         boat:PivotTo(destination)
@@ -949,6 +1311,171 @@ local function approachFishWithBoat(target)
 
     return true
 end
+
+
+local macroConnections = {}
+
+local function clearMacroConnections()
+    for _, connection in ipairs(macroConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(macroConnections)
+end
+
+local function beginMobileGestureCalibration()
+    if not IS_TOUCH_DEVICE then
+        return false, "Touch input is not enabled"
+    end
+
+    if state.mobileMacro.recording then
+        return false, "Calibration already running"
+    end
+
+    state.mobileMacro.recording = true
+    state.mobileMacro.calibrated = false
+    state.mobileMacro.events = {}
+    state.mobileMacro.startedAt = os.clock()
+    state.mobileMacro.duration = 0
+    state.mobileMacro.lastMessage = "Recording touch gesture"
+    clearMacroConnections()
+
+    local activeTouches = {}
+    local calibrationStart = state.mobileMacro.startedAt
+
+    table.insert(macroConnections, UserInputService.InputBegan:Connect(function(input, processed)
+        if not state.mobileMacro.recording then
+            return
+        end
+
+        if input.UserInputType == Enum.UserInputType.Touch then
+            local elapsed = os.clock() - calibrationStart
+
+            -- Ignore the first moment so the Calibration button's own release is never recorded.
+            if elapsed < 0.55 then
+                return
+            end
+
+            local key = tostring(input)
+            activeTouches[key] = true
+
+            table.insert(state.mobileMacro.events, {
+                t = elapsed,
+                state = Enum.UserInputState.Begin.Value,
+                x = input.Position.X,
+                y = input.Position.Y,
+            })
+        end
+    end))
+
+    table.insert(macroConnections, UserInputService.InputEnded:Connect(function(input, processed)
+        if not state.mobileMacro.recording then
+            return
+        end
+
+        if input.UserInputType == Enum.UserInputType.Touch then
+            local elapsed = os.clock() - calibrationStart
+
+            if elapsed < 0.55 then
+                return
+            end
+
+            table.insert(state.mobileMacro.events, {
+                t = elapsed,
+                state = Enum.UserInputState.End.Value,
+                x = input.Position.X,
+                y = input.Position.Y,
+            })
+        end
+    end))
+
+    -- Hide DChronos while recording so only normal game touches are captured.
+    main.Visible = false
+    floatButton.Visible = false
+
+    task.spawn(function()
+        task.wait(13)
+
+        if not state.mobileMacro.recording then
+            return
+        end
+
+        state.mobileMacro.recording = false
+        state.mobileMacro.duration = os.clock() - calibrationStart
+        clearMacroConnections()
+
+        main.Visible = true
+        floatButton.Visible = false
+        state.visible = true
+
+        local eventCount = #state.mobileMacro.events
+
+        if eventCount >= 2 then
+            state.mobileMacro.calibrated = true
+            state.mobileMacro.lastMessage = tostring(eventCount) .. " touch events captured"
+            state.fishing.cycleDelay = math.max(4, state.mobileMacro.duration + 1.5)
+            setStatus(
+                "Mobile claw gesture calibrated • "
+                    .. tostring(eventCount)
+                    .. " touch events",
+                "good"
+            )
+        else
+            state.mobileMacro.calibrated = false
+            state.mobileMacro.lastMessage = "No useful touch gesture captured"
+            setStatus(
+                "Calibration failed • repeat and perform one normal claw catch",
+                "bad"
+            )
+        end
+    end)
+
+    return true
+end
+
+local function playMobileGesture()
+    if not state.mobileMacro.calibrated then
+        return false, "Run Mobile Gesture Calibration first"
+    end
+
+    if not VirtualInputManager then
+        return false, "VirtualInputManager unavailable in this executor"
+    end
+
+    local events = state.mobileMacro.events
+    if #events == 0 then
+        return false, "Recorded gesture is empty"
+    end
+
+    local previousTime = 0
+    local touchId = 1
+
+    for _, event in ipairs(events) do
+        local delay = math.max(0, (event.t or 0) - previousTime)
+        if delay > 0 then
+            task.wait(delay)
+        end
+
+        local ok, err = pcall(function()
+            VirtualInputManager:SendTouchEvent(
+                touchId,
+                tonumber(event.state) or Enum.UserInputState.Begin.Value,
+                tonumber(event.x) or 0,
+                tonumber(event.y) or 0
+            )
+        end)
+
+        if not ok then
+            return false, tostring(err)
+        end
+
+        previousTime = event.t or previousTime
+    end
+
+    return true, "mobile-gesture"
+end
+
 
 local function findClawControlButton()
     local best, bestScore = nil, -math.huge
@@ -1028,14 +1555,20 @@ local function activateGuiButton(button)
 end
 
 local function sendClawInput()
-    -- PC Claw Fishing uses LMB / the labeled Claw control, not Space.
+    if IS_TOUCH_DEVICE then
+        if state.mobileMacro.calibrated then
+            return playMobileGesture()
+        end
+
+        return false, "Mobile gesture not calibrated"
+    end
+
     local button = findClawControlButton()
 
     if button then
         local ok, err = activateGuiButton(button)
         if not ok then return false, err end
 
-        -- Many builds use repeated presses for lower -> grab -> raise.
         task.wait(0.85)
         activateGuiButton(button)
         task.wait(0.45)
@@ -1044,7 +1577,6 @@ local function sendClawInput()
         return true, "gui-button:" .. fullNameSafe(button)
     end
 
-    -- Fallback: plain LMB at screen center.
     if not VirtualInputManager then
         return false, "No Claw GuiButton and VirtualInputManager unavailable"
     end
@@ -1071,13 +1603,12 @@ local function sendClawInput()
 end
 
 local function targetIsAligned(target)
-    if not target or not target.cframe then
+    if not target or not target.position then
         return false, math.huge
     end
 
     local origin, boat = getFishingOrigin()
     local claw = getPlayerClaw(origin)
-
     local sourcePosition = origin
 
     if claw then
@@ -1092,14 +1623,15 @@ local function targetIsAligned(target)
         end
     end
 
-    local fishPos = target.cframe.Position
+    local fishPos = target.position
     local horizontal = Vector3.new(
         fishPos.X - sourcePosition.X,
         0,
         fishPos.Z - sourcePosition.Z
     ).Magnitude
 
-    return horizontal <= 24, horizontal
+    -- Network positions are more accurate than scanning workspace fish models.
+    return horizontal <= 30, horizontal
 end
 
 local function runAutoFishingCycle()
@@ -1109,6 +1641,11 @@ local function runAutoFishingCycle()
 
     if state.fishing.pauseOnWarning and state.warningActive then
         setStatus("Auto Fishing paused: event warning detected", "warn")
+        return
+    end
+
+    if IS_TOUCH_DEVICE and not state.mobileMacro.calibrated then
+        setStatus("Auto Fishing needs Mobile Gesture Calibration first", "warn")
         return
     end
 
@@ -1123,9 +1660,10 @@ local function runAutoFishingCycle()
     updateFishHighlight(target)
 
     if not target then
+        local filterName = RARITY_FILTERS[state.fishing.filterIndex].name
         setStatus(
-            "Auto Fishing: no fish matches "
-                .. RARITY_FILTERS[state.fishing.filterIndex].name,
+            "No network fish matches " .. filterName
+                .. " • try Any if rarity metadata is unavailable",
             "warn"
         )
         state.fishing.busy = false
@@ -1134,11 +1672,22 @@ local function runAutoFishingCycle()
 
     if state.fishing.autoApproach then
         local ok, message = approachFishWithBoat(target)
+
         if not ok then
             setStatus("Auto Approach: " .. tostring(message), "warn")
-        else
-            task.wait(0.45)
-            target.cframe = getObjectCFrame(target.instance) or target.cframe
+            state.fishing.busy = false
+            return
+        end
+
+        task.wait(0.65)
+
+        local liveFish = state.fishing.networkFish[target.id]
+        local livePos = liveFish and getNetworkFishPosition(liveFish)
+
+        if livePos then
+            target.position = livePos
+            target.cframe = CFrame.new(livePos)
+            target.distance = (livePos - getFishingOrigin()).Magnitude
         end
     end
 
@@ -1147,9 +1696,8 @@ local function runAutoFishingCycle()
     if not aligned then
         setStatus(
             string.format(
-                "Target %s (%s) is %.0f studs from claw",
-                target.instance.Name,
-                target.rarity,
+                "%s is %.0f studs from claw • enable Auto Approach",
+                target.label or ("Fish #" .. tostring(target.id)),
                 distance
             ),
             "warn"
@@ -1158,11 +1706,11 @@ local function runAutoFishingCycle()
         return
     end
 
+    local caughtBefore = state.fishing.lastCaughtAt
+
     setStatus(
-        "Auto Fishing: claw cycle → "
-            .. target.instance.Name
-            .. " • "
-            .. target.rarity,
+        "Auto Fishing → "
+            .. (target.label or ("Fish #" .. tostring(target.id))),
         "good"
     )
 
@@ -1170,12 +1718,27 @@ local function runAutoFishingCycle()
 
     if not ok then
         setStatus("Auto Fishing input failed: " .. tostring(message), "bad")
+        state.fishing.busy = false
+        return
     end
 
-    task.wait(1.2)
+    -- Passive confirmation: FishUpdate "freeze" names the catcher and caught fish id.
+    local waitStart = os.clock()
+
+    while os.clock() - waitStart < 4 do
+        if state.fishing.lastCaughtAt > caughtBefore then
+            setStatus(
+                "Catch confirmed • Fish ID "
+                    .. tostring(state.fishing.lastCaughtFishId or "?"),
+                "good"
+            )
+            break
+        end
+        task.wait(0.15)
+    end
+
     state.fishing.busy = false
 end
-
 
 
 
@@ -1465,6 +2028,32 @@ local function copyText(text)
 
     print(text)
     return false
+end
+
+
+
+-- Permanent passive network fish radar ---------------------------------------
+
+local networkRadarConnection = nil
+
+local function startNetworkFishRadar()
+    if networkRadarConnection then
+        return true
+    end
+
+    local events = ReplicatedStorage:FindFirstChild("Events")
+    local fishUpdate = events and events:FindFirstChild("FishUpdate")
+
+    if not fishUpdate or not fishUpdate:IsA("RemoteEvent") then
+        return false
+    end
+
+    networkRadarConnection = fishUpdate.OnClientEvent:Connect(function(action, payload)
+        pcall(handleNetworkFishUpdate, action, payload)
+    end)
+
+    rebuildSpeciesCatalog()
+    return true
 end
 
 
@@ -2105,10 +2694,11 @@ fishingValues.target = createInfoRow(fishingPage, 39, "Target Fish")
 fishingValues.rarity = createInfoRow(fishingPage, 78, "Target Rarity")
 fishingValues.distance = createInfoRow(fishingPage, 117, "Target Distance")
 
-local rarityButton = createActionButton(fishingPage, 0, 160, 1, "Rarity Filter: Rare+")
+local rarityButton = createActionButton(fishingPage, 0, 160, 1, "Rarity Filter: Any")
 local autoFishingButton = createActionButton(fishingPage, 0, 205, 0.49, "Auto Fishing: OFF")
 local autoApproachButton = createActionButton(fishingPage, 0.51, 205, 0.49, "Auto Approach: OFF")
 local scanFishButton = createActionButton(fishingPage, 0, 250, 1, "Scan / Select Fish Target")
+local calibrateGestureButton = createActionButton(fishingPage, 0, 295, 1, "Calibrate iPad Claw Gesture (13s)")
 
 autoFishingButton.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
 autoFishingButton.TextColor3 = Color3.fromRGB(233, 198, 159)
@@ -2287,37 +2877,68 @@ end
 
 
 local function refreshFishing(forceScan)
-    local target = nil
+    local target = state.fishing.currentTarget
 
-    if forceScan
-        or not state.fishing.currentTarget
-        or not state.fishing.currentTarget.Parent then
+    if forceScan or not target then
         target = scanFishTarget()
         updateFishHighlight(target)
-    elseif state.fishing.currentTarget then
-        local cf = getObjectCFrame(state.fishing.currentTarget)
-        local origin = getFishingOrigin()
+    elseif target.id then
+        local fish = state.fishing.networkFish[target.id]
+        local livePos = fish and getNetworkFishPosition(fish)
 
-        if cf then
-            state.fishing.currentDistance = (cf.Position - origin).Magnitude
+        if livePos then
+            target.position = livePos
+            target.cframe = CFrame.new(livePos)
+            local origin = getFishingOrigin()
+            target.distance = (livePos - origin).Magnitude
+            state.fishing.currentDistance = target.distance
+
+            if fishHighlight and fishHighlight.Parent then
+                fishHighlight.CFrame = CFrame.new(livePos)
+            end
+        else
+            state.fishing.currentTarget = nil
+            target = scanFishTarget()
+            updateFishHighlight(target)
         end
     end
 
     local filter = RARITY_FILTERS[state.fishing.filterIndex]
     fishingValues.filter.Text = filter.name
 
-    if state.fishing.currentTarget and state.fishing.currentTarget.Parent then
-        fishingValues.target.Text = state.fishing.currentTarget.Name
-        fishingValues.rarity.Text = state.fishing.currentRarity
+    if target then
+        fishingValues.target.Text =
+            target.speciesName
+            or ("Species #" .. tostring(target.speciesId or "?"))
+
+        local rarityText = target.rarity or "Unknown"
+
+        if target.mutation then
+            rarityText = rarityText .. " • " .. tostring(target.mutation)
+        end
+
+        fishingValues.rarity.Text = rarityText
         fishingValues.distance.Text = string.format(
-            "%.0f studs • %d candidates",
-            state.fishing.currentDistance,
+            "%.0f studs • %d network fish",
+            tonumber(target.distance) or 0,
             state.fishing.candidates
         )
     else
-        fishingValues.target.Text = "None"
-        fishingValues.rarity.Text = "—"
-        fishingValues.distance.Text = tostring(state.fishing.candidates) .. " candidates"
+        fishingValues.target.Text = state.fishing.networkReady
+            and "No matching target"
+            or "Waiting for FishUpdate"
+
+        fishingValues.rarity.Text =
+            state.fishing.speciesCatalogCount > 0
+            and ("Catalog: " .. tostring(state.fishing.speciesCatalogCount))
+            or "Rarity metadata not resolved"
+
+        local fishCount = 0
+        for _ in pairs(state.fishing.networkFish) do
+            fishCount += 1
+        end
+
+        fishingValues.distance.Text = tostring(fishCount) .. " network fish tracked"
     end
 end
 
@@ -2506,6 +3127,37 @@ autoButton.MouseButton1Click:Connect(function()
 end)
 
 
+
+calibrateGestureButton.MouseButton1Click:Connect(function()
+    calibrateGestureButton.Text = "Recording... perform ONE normal catch"
+
+    local ok, message = beginMobileGestureCalibration()
+
+    if not ok then
+        calibrateGestureButton.Text = "Calibrate iPad Claw Gesture (13s)"
+        setStatus(tostring(message), "bad")
+        return
+    end
+
+    setStatus(
+        "Calibration started • DChronos hidden • perform ONE normal claw catch",
+        "good"
+    )
+
+    task.spawn(function()
+        task.wait(13.4)
+
+        if state.mobileMacro.calibrated then
+            calibrateGestureButton.Text =
+                "Gesture Ready • "
+                .. tostring(#state.mobileMacro.events)
+                .. " events"
+        else
+            calibrateGestureButton.Text = "Calibrate iPad Claw Gesture (13s)"
+        end
+    end)
+end)
+
 rarityButton.MouseButton1Click:Connect(function()
     state.fishing.filterIndex += 1
 
@@ -2515,6 +3167,13 @@ rarityButton.MouseButton1Click:Connect(function()
 
     local filter = RARITY_FILTERS[state.fishing.filterIndex]
     rarityButton.Text = "Rarity Filter: " .. filter.name
+
+    if filter.minRank > 0 and state.fishing.speciesCatalogCount == 0 then
+        setStatus(
+            "Live rarity catalog not found • filter may return no fish; Any still works",
+            "warn"
+        )
+    end
 
     local target = scanFishTarget()
     updateFishHighlight(target)
@@ -2593,6 +3252,14 @@ end)
 closeButton.MouseButton1Click:Connect(function()
     stopProtocolRecording()
     disconnectProtocolConnections()
+    clearMacroConnections()
+
+    if networkRadarConnection then
+        pcall(function()
+            networkRadarConnection:Disconnect()
+        end)
+        networkRadarConnection = nil
+    end
 
     if fishHighlight then
         fishHighlight:Destroy()
@@ -2665,6 +3332,7 @@ gui.Parent = playerGui
 switchTab("Dashboard")
 
 task.spawn(function()
+    startNetworkFishRadar()
     state.scan = scanWorkspaceCounts()
     rescanTargets()
     refreshDashboard(false)
@@ -2710,4 +3378,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Mobile Safe Calibration v1.2.7 loaded.")
+print("[DChronos Native] Claw Fishing Network Radar v1.2.8 loaded.")
