@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Protocol Recorder v1.2.6
+    Edition: Mobile Safe Calibration v1.2.7
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.2.6"
+local MODULE_VERSION = "1.2.7"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -44,6 +44,10 @@ local VirtualInputManager = nil
 pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
 end)
+
+local IS_TOUCH_DEVICE = UserInputService.TouchEnabled
+local HAS_KEYBOARD = UserInputService.KeyboardEnabled
+local MOBILE_SAFE_MODE = IS_TOUCH_DEVICE and not HAS_KEYBOARD
 
 local player = Players.LocalPlayer
 if not player then
@@ -1298,6 +1302,23 @@ local function protocolLog(direction, remote, args)
 
     table.insert(protocolState.logs, line)
 
+    if direction:find("IN/", 1, true) then
+        local name = remote and remote.Name or ""
+        if name == "FishUpdate"
+            or name == "PullFish"
+            or name == "CatchSuccess"
+            or name == "WeatherState" then
+            table.insert(
+                protocolState.logs,
+                string.format(
+                    "[%07.3f] SNAPSHOT %s",
+                    elapsed,
+                    clawStateSnapshot()
+                )
+            )
+        end
+    end
+
     if #protocolState.logs > 500 then
         table.remove(protocolState.logs, 1)
     end
@@ -1375,13 +1396,21 @@ local function startProtocolRecording()
     protocolState.startedAt = os.clock()
     protocolState.enabled = true
 
-    local hookOk, hookStatus = installOutgoingProtocolHook()
+    local hookOk = false
+    local hookStatus = "mobile-safe-passive"
     local listenerCount = installIncomingProtocolListeners()
+
+    -- iPad/mobile-safe mode intentionally does NOT hook outgoing __namecall.
+    -- Some mobile executors can disturb RemoteFunction timing and leave the claw stuck.
+    if not MOBILE_SAFE_MODE then
+        hookOk, hookStatus = installOutgoingProtocolHook()
+    end
 
     table.insert(
         protocolState.logs,
         string.format(
-            "[000.000] RECORDER START hook=%s(%s) incomingListeners=%d",
+            "[000.000] RECORDER START mode=%s hook=%s(%s) incomingListeners=%d",
+            MOBILE_SAFE_MODE and "MOBILE_PASSIVE" or "DESKTOP_DEEP",
             tostring(hookOk),
             tostring(hookStatus),
             listenerCount
@@ -1402,7 +1431,7 @@ end
 
 local function buildProtocolReport()
     local lines = {
-        "=== DChronos Claw Fishing Protocol Recording ===",
+        "=== DChronos Claw Fishing Mobile Safe Recording ===",
         "ModuleVersion=" .. MODULE_VERSION,
         "PlaceId=" .. tostring(game.PlaceId),
         "UniverseId=" .. tostring(game.GameId),
@@ -1464,6 +1493,87 @@ local function relevantAttributes(instance)
     return #parts > 0 and table.concat(parts, ", ") or "-"
 end
 
+
+local function visibleGameButtonsReport()
+    local lines = {}
+    local count = 0
+
+    for _, obj in ipairs(playerGui:GetDescendants()) do
+        if obj:IsA("GuiButton") and obj.Visible and not obj:IsDescendantOf(gui) then
+            count += 1
+
+            local text = ""
+            local image = ""
+
+            pcall(function()
+                text = obj.Text
+            end)
+
+            pcall(function()
+                image = obj.Image
+            end)
+
+            table.insert(
+                lines,
+                string.format(
+                    "%02d | %s | %s | text=%q | image=%q | pos=(%.0f,%.0f) size=(%.0f,%.0f)",
+                    count,
+                    obj.ClassName,
+                    fullNameSafe(obj),
+                    tostring(text),
+                    tostring(image),
+                    obj.AbsolutePosition.X,
+                    obj.AbsolutePosition.Y,
+                    obj.AbsoluteSize.X,
+                    obj.AbsoluteSize.Y
+                )
+            )
+
+            if count >= 80 then
+                break
+            end
+        end
+    end
+
+    if #lines == 0 then
+        table.insert(lines, "NO VISIBLE GAME BUTTONS")
+    end
+
+    return lines
+end
+
+local function clawStateSnapshot()
+    local boat = getPlayerBoat()
+    local parts = {}
+
+    if boat then
+        local claw = boat:FindFirstChild("Claw", true)
+        local crane = boat:FindFirstChild("Crane", true)
+        local hull = boat:FindFirstChild("Hull", true)
+
+        if claw then
+            local cf = getObjectCFrame(claw)
+            table.insert(parts, "Claw=" .. fullNameSafe(claw))
+            if cf then
+                table.insert(parts, string.format("ClawPos=(%.2f,%.2f,%.2f)", cf.X, cf.Y, cf.Z))
+            end
+        end
+
+        if crane then
+            table.insert(parts, "Crane=" .. fullNameSafe(crane))
+        end
+
+        if hull then
+            local cf = getObjectCFrame(hull)
+            if cf then
+                table.insert(parts, string.format("HullPos=(%.2f,%.2f,%.2f)", cf.X, cf.Y, cf.Z))
+            end
+        end
+    end
+
+    return #parts > 0 and table.concat(parts, " | ") or "No boat/claw state"
+end
+
 local function buildDiagnosticReport()
     local lines = {}
 
@@ -1476,9 +1586,18 @@ local function buildDiagnosticReport()
     add("PlaceId=" .. tostring(game.PlaceId))
     add("UniverseId=" .. tostring(game.GameId))
     add("Player=" .. tostring(player.Name) .. " (" .. tostring(player.UserId) .. ")")
+    add("TouchEnabled=" .. tostring(UserInputService.TouchEnabled))
+    add("KeyboardEnabled=" .. tostring(UserInputService.KeyboardEnabled))
+    add("RecorderMode=" .. (MOBILE_SAFE_MODE and "MOBILE_PASSIVE" or "DESKTOP_DEEP"))
     add("")
 
     local clawButton = findClawControlButton()
+    add("[Visible Game Buttons]")
+    for _, line in ipairs(visibleGameButtonsReport()) do
+        add(line)
+    end
+    add("")
+
     add("[ClawControl]")
     if clawButton then
         local text = ""
@@ -2002,7 +2121,7 @@ local debugInfo = Instance.new("TextLabel")
 debugInfo.BackgroundTransparency = 1
 debugInfo.Size = UDim2.new(1, 0, 0, 105)
 debugInfo.Font = Enum.Font.Gotham
-debugInfo.Text = "Calibration mode scans the live game structure.\n\nRun it while you are seated in your boat and can see fish nearby. Then copy the report and send it back to me."
+debugInfo.Text = "iPad Safe Calibration: recorder is passive and does not hook outgoing remotes.\n\nSit in your boat, keep fish visible, then record ONE manual catch and copy the report."
 debugInfo.TextWrapped = true
 debugInfo.TextSize = 11
 debugInfo.TextColor3 = Color3.fromRGB(158, 166, 184)
@@ -2022,7 +2141,7 @@ boatStatus.Text = "Unknown"
 local runDiagnosticsButton = createActionButton(debugPage, 0, 235, 0.49, "Scan Runtime")
 local copyDiagnosticsButton = createActionButton(debugPage, 0.51, 235, 0.49, "Copy Report")
 
-local protocolStartButton = createActionButton(debugPage, 0, 280, 0.32, "Record Catch")
+local protocolStartButton = createActionButton(debugPage, 0, 280, 0.32, "Record Mobile Catch")
 local protocolStopButton = createActionButton(debugPage, 0.34, 280, 0.32, "Stop")
 local protocolCopyButton = createActionButton(debugPage, 0.68, 280, 0.32, "Copy Protocol")
 
@@ -2032,14 +2151,19 @@ protocolStartButton.TextColor3 = Color3.fromRGB(168, 237, 188)
 protocolStartButton.MouseButton1Click:Connect(function()
     local hookOk, hookStatus, listenerCount = startProtocolRecording()
 
-    if hookOk then
+    if MOBILE_SAFE_MODE then
+        setStatus(
+            "Mobile Safe recording ON • manually catch ONE fish now",
+            "good"
+        )
+    elseif hookOk then
         setStatus(
             "Protocol recording ON • manually catch ONE fish now",
             "good"
         )
     else
         setStatus(
-            "Incoming recorder ON; outgoing hook unavailable: " .. tostring(hookStatus),
+            "Passive recording ON; outgoing hook unavailable: " .. tostring(hookStatus),
             "warn"
         )
     end
@@ -2050,7 +2174,7 @@ end)
 
 protocolStopButton.MouseButton1Click:Connect(function()
     stopProtocolRecording()
-    protocolStartButton.Text = "Record Catch"
+    protocolStartButton.Text = "Record Mobile Catch"
     runtimeStatus.Text = tostring(#protocolState.logs) .. " events"
     setStatus("Protocol recording stopped", "good")
 end)
@@ -2060,7 +2184,7 @@ protocolCopyButton.MouseButton1Click:Connect(function()
     local report = buildProtocolReport()
     local copied = copyText(report)
 
-    protocolStartButton.Text = "Record Catch"
+    protocolStartButton.Text = "Record Mobile Catch"
     runtimeStatus.Text = tostring(#protocolState.logs) .. " events"
 
     if copied then
@@ -2586,4 +2710,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Protocol Recorder v1.2.6 loaded.")
+print("[DChronos Native] Claw Fishing Mobile Safe Calibration v1.2.7 loaded.")
