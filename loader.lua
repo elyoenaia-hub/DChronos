@@ -1,5 +1,5 @@
 --[[
-    DChronos Loader v1.2.1 — Native Edition
+    DChronos Loader v1.2.2 — Native Edition
 
     No third-party module bridge.
     Registry metadata is local to DChronos.
@@ -16,7 +16,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local VERSION = "1.2.1"
+local VERSION = "1.2.2"
 local REPO_OWNER = "elyoenaia-hub"
 local REPO_NAME = "DChronos"
 local BRANCH = "main"
