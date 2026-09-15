@@ -1,7 +1,7 @@
 --[[
     DChronos Native Module
     Game: Claw Fishing
-    Edition: Mobile Fishing Engine v1.3.0
+    Edition: ATM Target Engine v1.3.1
 
     Native DChronos features:
       - Floating DC toggle + minimize
@@ -27,7 +27,7 @@
 
 local EXPECTED_PLACE_ID = 128931272139211
 local EXPECTED_UNIVERSE_ID = 10008606756
-local MODULE_VERSION = "1.3.0"
+local MODULE_VERSION = "1.3.1"
 
 if tonumber(game.PlaceId) ~= EXPECTED_PLACE_ID
     and tonumber(game.GameId) ~= EXPECTED_UNIVERSE_ID then
@@ -115,6 +115,14 @@ local state = {
         inputStrategyIndex = 1,
         lastInputStrategy = "None",
         failedInputCycles = 0,
+
+        -- Clean-room ATM target modes inspired by the behavior observed in
+        -- Ouroboros: catch-any, best-fish, fish-filter, and mutation-only.
+        targetModeIndex = 2, -- Best Fish
+        mutatedOnly = false,
+        preferMutation = true,
+        targetModeName = "Best Fish",
+
         networkFish = {},
         networkReady = false,
         lastCaughtFishId = nil,
@@ -560,11 +568,40 @@ local FISH_KEYWORDS = {
 
 local fishHighlight = nil
 
+local RARITY_SCAN_ORDER = {
+    { "legendary", 5 },
+    { "mythical", 6 },
+    { "mythic", 6 },
+    { "uncommon", 2 },
+    { "special", 7 },
+    { "secret", 7 },
+    { "limited", 7 },
+    { "exotic", 7 },
+    { "event", 7 },
+    { "common", 1 },
+    { "epic", 4 },
+    { "rare", 3 },
+}
+
 local function rarityFromText(value)
     local text = lower(value)
 
-    for alias, rank in pairs(RARITY_ALIASES) do
-        if text == alias or text:find(alias, 1, true) then
+    if text == "" then
+        return nil, nil
+    end
+
+    -- Exact first.
+    local exact = RARITY_ALIASES[text]
+    if exact then
+        return exact, RARITY_NAMES[exact]
+    end
+
+    -- Then ordered contains matching so "uncommon" never becomes "common".
+    for _, item in ipairs(RARITY_SCAN_ORDER) do
+        local alias = item[1]
+        local rank = item[2]
+
+        if text:find(alias, 1, true) then
             return rank, RARITY_NAMES[rank]
         end
     end
@@ -729,23 +766,249 @@ local function readInstanceSpeciesMetadata(instance)
     return speciesId, rarityValue, displayName
 end
 
-local function rebuildSpeciesCatalog()
+
+local function safeRequireModule(moduleScript)
+    if not moduleScript or not moduleScript:IsA("ModuleScript") then
+        return nil
+    end
+
+    local ok, result = pcall(require, moduleScript)
+
+    if ok and type(result) == "table" then
+        return result
+    end
+
+    return nil
+end
+
+local function findReplicatedModuleByName(name)
+    local wanted = lower(name)
+
+    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+        if obj:IsA("ModuleScript") and lower(obj.Name) == wanted then
+            return obj
+        end
+    end
+
+    return nil
+end
+
+local function deepFindNumericKey(tableValue, wantedKey, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+
+    if type(tableValue) ~= "table" or depth > 5 or seen[tableValue] then
+        return nil
+    end
+
+    seen[tableValue] = true
+
+    if tableValue[wantedKey] ~= nil then
+        local result = tableValue[wantedKey]
+        seen[tableValue] = nil
+        return result
+    end
+
+    for _, value in pairs(tableValue) do
+        if type(value) == "table" then
+            local result = deepFindNumericKey(value, wantedKey, depth + 1, seen)
+            if result ~= nil then
+                seen[tableValue] = nil
+                return result
+            end
+        end
+    end
+
+    seen[tableValue] = nil
+    return nil
+end
+
+local function normalizeFishMetadataRecord(speciesId, record, sourceName)
+    if type(record) ~= "table" then
+        return nil
+    end
+
+    local name =
+        record.name
+        or record.Name
+        or record.displayName
+        or record.DisplayName
+        or record.fishName
+        or record.FishName
+
+    local rarity =
+        record.rarity
+        or record.Rarity
+        or record.tier
+        or record.Tier
+        or record.grade
+        or record.Grade
+
+    local rank, rarityName = rarityFromText(rarity)
+
+    if not rank and tonumber(rarity) then
+        rank = math.clamp(math.floor(tonumber(rarity)), 1, 7)
+        rarityName = RARITY_NAMES[rank]
+    end
+
+    return {
+        speciesId = tonumber(speciesId),
+        name = type(name) == "string" and name or nil,
+        rank = rank or 0,
+        rarity = rarityName or (rarity ~= nil and tostring(rarity) or "Unknown"),
+        source = sourceName,
+    }
+end
+
+local function readOuroborosStyleReplicatedMetadata()
     local catalog = {}
+    local sourceCount = 0
+
+    local candidateNames = {
+        "FishInfo",
+        "RarityInfo",
+        "MutationInfo",
+        "IdToName",
+        "FishRarities",
+        "Rarities",
+    }
+
+    local loaded = {}
+
+    for _, name in ipairs(candidateNames) do
+        local moduleScript = findReplicatedModuleByName(name)
+        local value = safeRequireModule(moduleScript)
+
+        if value then
+            loaded[name] = value
+            sourceCount += 1
+        end
+    end
+
+    -- FishInfo-style tables are the strongest source because they commonly
+    -- carry species/name/rarity together.
+    local fishInfo = loaded.FishInfo
+
+    if type(fishInfo) == "table" then
+        for key, record in pairs(fishInfo) do
+            local speciesId = tonumber(key)
+
+            if type(record) == "table" then
+                speciesId =
+                    speciesId
+                    or tonumber(record.id)
+                    or tonumber(record.Id)
+                    or tonumber(record.speciesId)
+                    or tonumber(record.SpeciesId)
+            end
+
+            if speciesId then
+                local normalized = normalizeFishMetadataRecord(
+                    speciesId,
+                    record,
+                    "Module:FishInfo"
+                )
+
+                if normalized then
+                    catalog[speciesId] = normalized
+                end
+            end
+        end
+    end
+
+    -- IdToName can fill names even when FishInfo is absent.
+    local idToName = loaded.IdToName
+
+    if type(idToName) == "table" then
+        for key, name in pairs(idToName) do
+            local speciesId = tonumber(key)
+
+            if speciesId and type(name) == "string" then
+                catalog[speciesId] = catalog[speciesId] or {
+                    speciesId = speciesId,
+                    rank = 0,
+                    rarity = "Unknown",
+                    source = "Module:IdToName",
+                }
+
+                catalog[speciesId].name = name
+            end
+        end
+    end
+
+    -- RarityInfo / FishRarities can fill rarity by species id when keyed that way.
+    for _, sourceName in ipairs({"RarityInfo", "FishRarities", "Rarities"}) do
+        local tbl = loaded[sourceName]
+
+        if type(tbl) == "table" then
+            for speciesId, info in pairs(catalog) do
+                local rarityValue = deepFindNumericKey(tbl, speciesId)
+
+                if rarityValue ~= nil then
+                    if type(rarityValue) == "table" then
+                        rarityValue =
+                            rarityValue.rarity
+                            or rarityValue.Rarity
+                            or rarityValue.name
+                            or rarityValue.Name
+                            or rarityValue.tier
+                            or rarityValue.Tier
+                    end
+
+                    local rank, rarityName = rarityFromText(rarityValue)
+
+                    if not rank and tonumber(rarityValue) then
+                        rank = math.clamp(
+                            math.floor(tonumber(rarityValue)),
+                            1,
+                            7
+                        )
+                        rarityName = RARITY_NAMES[rank]
+                    end
+
+                    if rank then
+                        info.rank = rank
+                        info.rarity = rarityName
+                        info.source = info.source .. "+" .. sourceName
+                    end
+                end
+            end
+        end
+    end
+
+    return catalog, sourceCount
+end
+
+
+local function rebuildSpeciesCatalog()
+    local catalog, moduleSourceCount =
+        readOuroborosStyleReplicatedMetadata()
+
     local count = 0
 
+    for _ in pairs(catalog) do
+        count += 1
+    end
+
+    -- Existing generic replicated metadata remains a fallback.
     for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
         if obj:IsA("Folder")
             or obj:IsA("Model")
             or obj:IsA("Configuration")
             or obj:IsA("ValueBase") then
 
-            local speciesId, rarityValue, displayName = readInstanceSpeciesMetadata(obj)
+            local speciesId, rarityValue, displayName =
+                readInstanceSpeciesMetadata(obj)
 
             if speciesId and rarityValue ~= nil then
                 local rank, rarityName = rarityFromText(rarityValue)
 
                 if not rank and tonumber(rarityValue) then
-                    rank = math.clamp(math.floor(tonumber(rarityValue)), 1, 7)
+                    rank = math.clamp(
+                        math.floor(tonumber(rarityValue)),
+                        1,
+                        7
+                    )
                     rarityName = RARITY_NAMES[rank]
                 end
 
@@ -754,11 +1017,15 @@ local function rebuildSpeciesCatalog()
                         count += 1
                     end
 
+                    local existing = catalog[speciesId] or {}
+
                     catalog[speciesId] = {
-                        rank = rank,
-                        rarity = rarityName or tostring(rarityValue),
-                        name = displayName or obj.Name,
-                        source = fullNameSafe(obj),
+                        speciesId = speciesId,
+                        rank = rank or existing.rank or 0,
+                        rarity = rarityName or existing.rarity or tostring(rarityValue),
+                        name = existing.name or displayName or obj.Name,
+                        source = existing.source
+                            or ("Replicated:" .. fullNameSafe(obj)),
                     }
                 end
             end
@@ -767,6 +1034,8 @@ local function rebuildSpeciesCatalog()
 
     state.fishing.speciesCatalog = catalog
     state.fishing.speciesCatalogCount = count
+    state.fishing.metadataModuleCount = moduleSourceCount or 0
+
     return count
 end
 
@@ -1102,6 +1371,52 @@ local function fishMatchesFilter(rank)
     return rank >= filter.minRank
 end
 
+
+local TARGET_MODES = {
+    "Catch Any",
+    "Best Fish",
+    "Mutation Hunt",
+}
+
+local MUTATION_PRIORITY = {
+    rainbow = 4,
+    gold = 3,
+    silver = 2,
+    shocked = 2,
+}
+
+local function mutationRank(mutation)
+    local key = lower(mutation)
+    if key == "" then
+        return 0
+    end
+    return MUTATION_PRIORITY[key] or 1
+end
+
+local function targetModeScore(fish, info, distance)
+    local mode = TARGET_MODES[state.fishing.targetModeIndex]
+    local rarityRank = tonumber(info.rank) or 0
+    local mutationScore = mutationRank(fish.mutation)
+
+    if mode == "Catch Any" then
+        return -distance
+    elseif mode == "Mutation Hunt" then
+        if mutationScore <= 0 then
+            return nil
+        end
+        return (mutationScore * 1000000)
+            + (rarityRank * 100000)
+            - distance
+    end
+
+    -- Best Fish:
+    -- rarity first, mutation second, distance third.
+    return (rarityRank * 1000000)
+        + (mutationScore * 100000)
+        - distance
+end
+
+
 local function scanFishTarget()
     local origin = getFishingOrigin()
     local best = nil
@@ -1115,54 +1430,53 @@ local function scanFishTarget()
         if position and not fish.frozen then
             local info = getSpeciesInfo(fish.speciesId)
             local rank = tonumber(info.rank) or 0
+            local mutation = fish.mutation
 
-            local matches = false
+            local matchesRarity = false
 
             if filter.minRank == 0 then
-                matches = true
+                matchesRarity = true
             elseif rank > 0 then
                 if filter.name == "Special" then
-                    matches = rank >= 7
+                    matchesRarity = rank >= 7
                 else
-                    matches = rank >= filter.minRank
+                    matchesRarity = rank >= filter.minRank
                 end
             end
 
-            if matches then
-                candidates += 1
+            local matchesMutation =
+                (not state.fishing.mutatedOnly)
+                or mutationRank(mutation) > 0
 
+            if matchesRarity and matchesMutation then
                 local distance = (position - origin).Magnitude
-                local rankScore = rank > 0 and rank or 0
+                local score = targetModeScore(fish, info, distance)
 
-                -- Prefer known higher rarity, then mutation, then closer distance.
-                local mutationBonus = 0
-                local mutation = lower(fish.mutation)
+                if score ~= nil then
+                    candidates += 1
 
-                if mutation == "rainbow" then
-                    mutationBonus = 30000
-                elseif mutation == "gold" then
-                    mutationBonus = 20000
-                elseif mutation == "silver" then
-                    mutationBonus = 10000
-                end
+                    if score > bestScore then
+                        bestScore = score
 
-                local score = (rankScore * 100000) + mutationBonus - distance
-
-                if score > bestScore then
-                    bestScore = score
-                    best = {
-                        id = id,
-                        speciesId = fish.speciesId,
-                        fish = fish,
-                        position = position,
-                        cframe = CFrame.new(position),
-                        rank = rank,
-                        rarity = info.rarity or "Unknown",
-                        speciesName = info.name or ("Species #" .. tostring(fish.speciesId)),
-                        mutation = fish.mutation,
-                        distance = distance,
-                        label = networkFishLabel(fish),
-                    }
+                        best = {
+                            id = id,
+                            speciesId = fish.speciesId,
+                            fish = fish,
+                            position = position,
+                            cframe = CFrame.new(position),
+                            rank = rank,
+                            rarity = info.rarity or "Unknown",
+                            speciesName =
+                                info.name
+                                or ("Species #" .. tostring(fish.speciesId)),
+                            mutation = mutation,
+                            distance = distance,
+                            label = networkFishLabel(fish),
+                            metadataSource = info.source or "Network",
+                            targetMode =
+                                TARGET_MODES[state.fishing.targetModeIndex],
+                        }
+                    end
                 end
             end
         end
@@ -1173,6 +1487,8 @@ local function scanFishTarget()
     state.fishing.currentRank = best and best.rank or 0
     state.fishing.currentDistance = best and best.distance or math.huge
     state.fishing.candidates = candidates
+    state.fishing.targetModeName =
+        TARGET_MODES[state.fishing.targetModeIndex]
 
     return best
 end
@@ -2728,7 +3044,7 @@ main = Instance.new("Frame")
 main.Name = "Main"
 main.AnchorPoint = Vector2.new(0, 0.5)
 main.Position = UDim2.new(0, 24, 0.5, 0)
-main.Size = UDim2.fromOffset(430, 645)
+main.Size = UDim2.fromOffset(430, 700)
 main.BackgroundColor3 = Color3.fromRGB(10, 13, 20)
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -2870,7 +3186,7 @@ local function createPage(name)
     page.Name = name .. "Page"
     page.BackgroundTransparency = 1
     page.Position = UDim2.fromOffset(20, 181)
-    page.Size = UDim2.new(1, -40, 0, 410)
+    page.Size = UDim2.new(1, -40, 0, 465)
     page.Visible = false
     page.Parent = main
     pages[name] = page
@@ -3063,12 +3379,14 @@ fishingValues.rarity = createInfoRow(fishingPage, 78, "Target Rarity")
 fishingValues.distance = createInfoRow(fishingPage, 117, "Target Distance")
 
 local rarityButton = createActionButton(fishingPage, 0, 160, 1, "Rarity Filter: Any")
-local autoFishingButton = createActionButton(fishingPage, 0, 205, 0.49, "Auto Fishing: OFF")
-local autoApproachButton = createActionButton(fishingPage, 0.51, 205, 0.49, "Auto Approach: OFF")
-local scanFishButton = createActionButton(fishingPage, 0, 250, 1, "Scan / Select Fish Target")
-local calibrateGestureButton = createActionButton(fishingPage, 0, 295, 1, "Calibrate iPad Claw Gesture (13s)")
-local testApproachButton = createActionButton(fishingPage, 0, 340, 0.49, "Test Approach Now")
-local testClawButton = createActionButton(fishingPage, 0.51, 340, 0.49, "Test Claw • ContextAction")
+local targetModeButton = createActionButton(fishingPage, 0, 205, 0.49, "Target: Best Fish")
+local mutatedOnlyButton = createActionButton(fishingPage, 0.51, 205, 0.49, "Mutation Only: OFF")
+local autoFishingButton = createActionButton(fishingPage, 0, 250, 0.49, "Auto Fishing: OFF")
+local autoApproachButton = createActionButton(fishingPage, 0.51, 250, 0.49, "Auto Approach: OFF")
+local scanFishButton = createActionButton(fishingPage, 0, 295, 1, "Scan / Select Fish Target")
+local calibrateGestureButton = createActionButton(fishingPage, 0, 340, 1, "Calibrate iPad Claw Gesture (13s)")
+local testApproachButton = createActionButton(fishingPage, 0, 385, 0.49, "Test Approach Now")
+local testClawButton = createActionButton(fishingPage, 0.51, 385, 0.49, "Test Claw • ContextAction")
 
 autoFishingButton.BackgroundColor3 = Color3.fromRGB(45, 35, 29)
 autoFishingButton.TextColor3 = Color3.fromRGB(233, 198, 159)
@@ -3081,7 +3399,7 @@ local debugInfo = Instance.new("TextLabel")
 debugInfo.BackgroundTransparency = 1
 debugInfo.Size = UDim2.new(1, 0, 0, 105)
 debugInfo.Font = Enum.Font.Gotham
-debugInfo.Text = "Mobile Fishing Engine: network fish + independent Auto Approach are active.\n\nAuto Fishing rotates ContextAction → calibrated button → coordinate click → touch replay until FishUpdate confirms a catch."
+debugInfo.Text = "ATM Target Engine: DChronos independently reproduces the observed target/filter flow (Best Fish, Catch Any, Mutation Hunt) using replicated metadata + FishUpdate.\n\nDirect CatchFish/ConfirmCatch remote execution from Ouroboros is intentionally not copied."
 debugInfo.TextWrapped = true
 debugInfo.TextSize = 11
 debugInfo.TextColor3 = Color3.fromRGB(158, 166, 184)
@@ -3289,9 +3607,10 @@ local function refreshFishing(forceScan)
 
         fishingValues.rarity.Text = rarityText
         fishingValues.distance.Text = string.format(
-            "%.0f studs • %d network fish",
+            "%.0f studs • %d candidates • %s",
             tonumber(target.distance) or 0,
-            state.fishing.candidates
+            state.fishing.candidates,
+            tostring(target.targetMode or state.fishing.targetModeName)
         )
     else
         fishingValues.target.Text = state.fishing.networkReady
@@ -3595,6 +3914,52 @@ calibrateGestureButton.MouseButton1Click:Connect(function()
     end)
 end)
 
+
+targetModeButton.MouseButton1Click:Connect(function()
+    state.fishing.targetModeIndex += 1
+
+    if state.fishing.targetModeIndex > #TARGET_MODES then
+        state.fishing.targetModeIndex = 1
+    end
+
+    local mode = TARGET_MODES[state.fishing.targetModeIndex]
+    targetModeButton.Text = "Target: " .. mode
+
+    local target = scanFishTarget()
+    updateFishHighlight(target)
+    refreshFishing(false)
+
+    setStatus("Target mode: " .. mode, "good")
+end)
+
+mutatedOnlyButton.MouseButton1Click:Connect(function()
+    state.fishing.mutatedOnly = not state.fishing.mutatedOnly
+
+    mutatedOnlyButton.Text =
+        state.fishing.mutatedOnly
+        and "Mutation Only: ON"
+        or "Mutation Only: OFF"
+
+    if state.fishing.mutatedOnly then
+        mutatedOnlyButton.BackgroundColor3 = Color3.fromRGB(25, 48, 37)
+        mutatedOnlyButton.TextColor3 = Color3.fromRGB(168, 237, 188)
+    else
+        mutatedOnlyButton.BackgroundColor3 = Color3.fromRGB(31, 37, 51)
+        mutatedOnlyButton.TextColor3 = Color3.fromRGB(233, 237, 247)
+    end
+
+    local target = scanFishTarget()
+    updateFishHighlight(target)
+    refreshFishing(false)
+
+    setStatus(
+        state.fishing.mutatedOnly
+            and "Mutation-only targeting enabled"
+            or "Mutation-only targeting disabled",
+        "good"
+    )
+end)
+
 rarityButton.MouseButton1Click:Connect(function()
     state.fishing.filterIndex += 1
 
@@ -3628,11 +3993,17 @@ scanFishButton.MouseButton1Click:Connect(function()
         refreshFishing(false)
 
         if target then
+            local mutationText =
+                target.mutation
+                and (" • " .. tostring(target.mutation))
+                or ""
+
             setStatus(
                 "Target selected: "
-                    .. target.instance.Name
+                    .. tostring(target.speciesName or target.label or target.id)
                     .. " • "
-                    .. target.rarity,
+                    .. tostring(target.rarity)
+                    .. mutationText,
                 "good"
             )
         else
@@ -3775,6 +4146,20 @@ switchTab("Dashboard")
 
 task.spawn(function()
     startNetworkFishRadar()
+
+    -- Replicated metadata modules may arrive slightly after the module starts.
+    task.spawn(function()
+        for attempt = 1, 5 do
+            local count = rebuildSpeciesCatalog()
+
+            if count > 0 then
+                break
+            end
+
+            task.wait(1.25)
+        end
+    end)
+
     state.scan = scanWorkspaceCounts()
     rescanTargets()
     refreshDashboard(false)
@@ -3872,4 +4257,4 @@ task.spawn(function()
     end
 end)
 
-print("[DChronos Native] Claw Fishing Mobile Fishing Engine v1.3.0 loaded.")
+print("[DChronos Native] Claw Fishing ATM Target Engine v1.3.1 loaded.")
